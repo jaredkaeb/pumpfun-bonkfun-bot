@@ -606,6 +606,16 @@ class UniversalTrader:
         except Exception:  # noqa: BLE001
             logger.debug("SOL price unavailable; storing position_size in SOL units")
 
+        # Compute sol_price for downstream USD conversions. Cache on the open
+        # trade row so we use a SINGLE consistent price across buy + sell of
+        # this trade (avoids weird PnL math if SOL price moves mid-trade).
+        sol_price_for_trade = 0.0
+        try:
+            from integrations.safety_filters import get_sol_price_usd
+            sol_price_for_trade = await get_sol_price_usd()
+        except Exception:  # noqa: BLE001
+            pass
+
         try:
             db_trade_id = await strategy_db.insert_trade_open(
                 strategy_id=self.strategy_id,
@@ -622,10 +632,12 @@ class UniversalTrader:
                 is_paper_trade=self.is_paper_trade,
             )
             if db_trade_id is not None:
+                # 4-tuple: (db_id, buy_ts_monotonic, entry_price_sol, sol_price_at_buy_usd)
                 self._open_trade_rows[mint_str] = (
                     db_trade_id,
                     monotonic(),
                     buy_result.price or 0.0,
+                    sol_price_for_trade,
                 )
         except Exception:
             logger.exception("Strategy DB: failed to record open trade for %s", mint_str)
@@ -775,16 +787,21 @@ class UniversalTrader:
             )
             return
 
-        trade_id, buy_ts, entry_price = rec
+        trade_id, buy_ts, entry_price, sol_price_at_buy = rec
         time_in_trade = int(monotonic() - buy_ts)
 
+        # Convert pnl to USD using the same sol_price snapshot we used at buy
+        # (consistent units across buy and sell of one trade). buy_amount is in
+        # SOL, so multiply by sol_price to get the dollar value of the position.
+        position_size_usd = self.buy_amount * sol_price_at_buy
+
         if failed_exit or exit_price_usd <= 0 or entry_price <= 0:
-            pnl_usd = -self.buy_amount  # treat as full-loss for accounting
+            pnl_usd = -position_size_usd  # full-loss in USD terms
             pnl_percent = -100.0
         else:
-            # pnl in SOL units: (exit - entry) / entry * buy_amount
+            # pnl% derived from SOL/token entry vs SOL/token exit (units cancel)
             pnl_percent = (exit_price_usd - entry_price) / entry_price * 100
-            pnl_usd = self.buy_amount * (pnl_percent / 100)
+            pnl_usd = position_size_usd * (pnl_percent / 100)
 
         try:
             await strategy_db.update_trade_close(
