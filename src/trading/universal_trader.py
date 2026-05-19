@@ -20,6 +20,8 @@ from cleanup.modes import (
 from core.client import SolanaClient
 from core.priority_fee.manager import PriorityFeeManager
 from core.wallet import Wallet
+from integrations import strategy_db  # AI Strategy Manager: SQLite writer
+from integrations.strategy_config import get_strategy_config  # AI Strategy Manager: config reader
 from interfaces.core import Platform, TokenInfo
 from monitoring.listener_factory import ListenerFactory
 from platforms import get_platform_implementations
@@ -57,6 +59,9 @@ class UniversalTrader:
         buy_amount: float,
         buy_slippage: float,
         sell_slippage: float,
+        # AI Strategy Manager integration
+        strategy_id: str = "default",
+        is_paper_trade: bool = False,
         # Platform configuration
         platform: Platform | str = Platform.PUMP_FUN,
         # Listener configuration
@@ -215,6 +220,14 @@ class UniversalTrader:
         self.processing: bool = False
         self.processed_tokens: set[str] = set()
         self.token_timestamps: dict[str, float] = {}
+
+        # AI Strategy Manager integration
+        self.strategy_id: str = strategy_id
+        self.is_paper_trade: bool = is_paper_trade
+        self.strategy_config = get_strategy_config()
+        # Maps mint string -> (db_trade_id, buy_timestamp_monotonic, entry_price)
+        # so we can update the row on sell with PnL and time-in-trade.
+        self._open_trade_rows: dict[str, tuple[int, float, float]] = {}
 
     async def start(self) -> None:
         """Start the trading bot and listen for new tokens."""
@@ -400,6 +413,13 @@ class UniversalTrader:
                     logger.info(
                         f"Skipping token {token_info.symbol} - too old ({token_age:.1f}s > {self.max_token_age}s)"
                     )
+                    # AI Strategy Manager: log to skipped_tokens
+                    await strategy_db.insert_skipped_token(
+                        strategy_id=self.strategy_id,
+                        token_address=str(token_info.mint),
+                        skip_reason="token_age_above_max",
+                        notes=f"age={token_age:.1f}s max={self.max_token_age}s",
+                    )
                     continue
 
                 self.processed_tokens.add(token_key)
@@ -420,6 +440,59 @@ class UniversalTrader:
     async def _handle_token(self, token_info: TokenInfo) -> None:
         """Handle a new token creation event."""
         try:
+            mint_str = str(token_info.mint)
+
+            # AI Strategy Manager: pause + emergency stop checks.
+            # These re-read the config file every 30s so Claude's pause directives
+            # take effect without a bot restart.
+            if self.strategy_config.is_emergency_stopped():
+                logger.warning(
+                    "Emergency stop active. Skipping token %s.", token_info.symbol
+                )
+                await strategy_db.insert_skipped_token(
+                    strategy_id=self.strategy_id,
+                    token_address=mint_str,
+                    skip_reason="emergency_stop_active",
+                )
+                return
+
+            if self.strategy_config.is_bot_paused():
+                logger.info(
+                    "Bot paused by Strategy Manager. Skipping token %s.",
+                    token_info.symbol,
+                )
+                await strategy_db.insert_skipped_token(
+                    strategy_id=self.strategy_id,
+                    token_address=mint_str,
+                    skip_reason="bot_paused",
+                )
+                return
+
+            if self.strategy_config.is_token_blacklisted(mint_str):
+                logger.info("Token %s is blacklisted. Skipping.", token_info.symbol)
+                await strategy_db.insert_skipped_token(
+                    strategy_id=self.strategy_id,
+                    token_address=mint_str,
+                    skip_reason="blacklist_token",
+                )
+                return
+
+            if token_info.creator and self.strategy_config.is_creator_blacklisted(
+                str(token_info.creator)
+            ):
+                logger.info(
+                    "Creator %s is blacklisted. Skipping token %s.",
+                    token_info.creator,
+                    token_info.symbol,
+                )
+                await strategy_db.insert_skipped_token(
+                    strategy_id=self.strategy_id,
+                    token_address=mint_str,
+                    skip_reason="blacklist_creator",
+                    notes=f"creator={token_info.creator}",
+                )
+                return
+
             # Validate that token is for our platform
             if token_info.platform != self.platform:
                 logger.warning(
@@ -470,6 +543,28 @@ class UniversalTrader:
             buy_result.amount,
             buy_result.tx_signature,
         )
+
+        # AI Strategy Manager: write the open trade row, remember the id for close.
+        # position_size_usd is the SOL spent × SOL price — we don't have SOL price here,
+        # so we use buy_amount (SOL) as a stand-in until Phase 2 wires in a price feed.
+        mint_str = str(token_info.mint)
+        try:
+            db_trade_id = await strategy_db.insert_trade_open(
+                strategy_id=self.strategy_id,
+                token_address=mint_str,
+                entry_price_usd=buy_result.price or 0.0,
+                position_size_usd=self.buy_amount,  # SOL units for now; convert in Phase 2
+                is_paper_trade=self.is_paper_trade,
+            )
+            if db_trade_id is not None:
+                self._open_trade_rows[mint_str] = (
+                    db_trade_id,
+                    monotonic(),
+                    buy_result.price or 0.0,
+                )
+        except Exception:
+            logger.exception("Strategy DB: failed to record open trade for %s", mint_str)
+
         self.traded_mints.add(token_info.mint)
         # Track token program for cleanup
         mint_str = str(token_info.mint)
@@ -492,6 +587,13 @@ class UniversalTrader:
     ) -> None:
         """Handle failed token purchase."""
         logger.error(f"Failed to buy {token_info.symbol}: {buy_result.error_message}")
+        # AI Strategy Manager: log as a skipped token with the underlying error
+        await strategy_db.insert_skipped_token(
+            strategy_id=self.strategy_id,
+            token_address=str(token_info.mint),
+            skip_reason="buy_tx_failed",
+            notes=(buy_result.error_message or "")[:500],
+        )
         # Close ATA if enabled
         await handle_cleanup_after_failure(
             self.solana_client,
@@ -555,6 +657,13 @@ class UniversalTrader:
                 sell_result.amount,
                 sell_result.tx_signature,
             )
+            # AI Strategy Manager: update the open trade row with exit info
+            await self._record_trade_close(
+                token_info=token_info,
+                exit_price_usd=sell_result.price or 0.0,
+                exit_reason="time_based",
+                failed_exit=False,
+            )
             # Close ATA if enabled
             await handle_cleanup_after_sell(
                 self.solana_client,
@@ -569,6 +678,62 @@ class UniversalTrader:
         else:
             logger.error(
                 f"Failed to sell {token_info.symbol}: {sell_result.error_message}"
+            )
+            # AI Strategy Manager: failed exits are critical — mark the trade
+            await self._record_trade_close(
+                token_info=token_info,
+                exit_price_usd=0.0,
+                exit_reason="failed_exit",
+                failed_exit=True,
+            )
+
+    async def _record_trade_close(
+        self,
+        *,
+        token_info: TokenInfo,
+        exit_price_usd: float,
+        exit_reason: str,
+        failed_exit: bool,
+    ) -> None:
+        """AI Strategy Manager: update the open trade row with close info.
+
+        Looks up the trade_id we stashed at buy time, computes pnl + time-in-trade,
+        and updates the row. Never raises.
+        """
+        mint_str = str(token_info.mint)
+        rec = self._open_trade_rows.pop(mint_str, None)
+        if rec is None:
+            logger.debug(
+                "No open trade row for %s — skipping close update.", mint_str
+            )
+            return
+
+        trade_id, buy_ts, entry_price = rec
+        time_in_trade = int(monotonic() - buy_ts)
+
+        if failed_exit or exit_price_usd <= 0 or entry_price <= 0:
+            pnl_usd = -self.buy_amount  # treat as full-loss for accounting
+            pnl_percent = -100.0
+        else:
+            # pnl in SOL units: (exit - entry) / entry * buy_amount
+            pnl_percent = (exit_price_usd - entry_price) / entry_price * 100
+            pnl_usd = self.buy_amount * (pnl_percent / 100)
+
+        try:
+            await strategy_db.update_trade_close(
+                trade_id=trade_id,
+                exit_price_usd=exit_price_usd,
+                pnl_usd=pnl_usd,
+                pnl_percent=pnl_percent,
+                exit_reason=exit_reason,
+                time_in_trade_seconds=time_in_trade,
+                failed_exit=failed_exit,
+            )
+        except Exception:
+            logger.exception(
+                "Strategy DB: failed to update trade close for %s (trade_id=%s)",
+                mint_str,
+                trade_id,
             )
 
     async def _monitor_position_until_exit(
@@ -623,6 +788,14 @@ class UniversalTrader:
                             sell_result.tx_signature,
                         )
 
+                        # AI Strategy Manager: update the open trade row
+                        await self._record_trade_close(
+                            token_info=token_info,
+                            exit_price_usd=sell_result.price or 0.0,
+                            exit_reason=exit_reason.value,
+                            failed_exit=False,
+                        )
+
                         # Log final PnL
                         final_pnl = position.get_pnl()
                         logger.info(
@@ -644,6 +817,10 @@ class UniversalTrader:
                         logger.error(
                             f"Failed to exit position: {sell_result.error_message}"
                         )
+                        # AI Strategy Manager: log the failed-exit attempt but don't
+                        # remove from _open_trade_rows yet — monitoring continues.
+                        # The row stays open until either a retry succeeds or the
+                        # process restarts.
                         # Keep monitoring in case sell can be retried
 
                     break

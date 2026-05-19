@@ -89,6 +89,9 @@ async def start_bot(config_path: str):
             rpc_endpoint=cfg["rpc_endpoint"],
             wss_endpoint=cfg["wss_endpoint"],
             private_key=cfg["private_key"],
+            # AI Strategy Manager integration
+            strategy_id=cfg.get("strategy_id", cfg.get("name", "default")),
+            is_paper_trade=cfg.get("paper_trade", False),
             # Platform configuration - pass platform enum directly
             platform=platform,
             # Trade parameters
