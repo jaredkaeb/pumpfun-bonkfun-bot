@@ -219,6 +219,9 @@ async def filter_rugcheck(ctx: FilterContext) -> FilterResult:
     except aiohttp.ClientError as e:
         logger.warning("rugcheck network error for %s: %s", mint, e)
         return FilterResult(passed=False, skip_reason="rugcheck_network_error")
+    except Exception as e:  # noqa: BLE001 — JSON decode errors, encoding issues, etc.
+        logger.warning("rugcheck unexpected error for %s: %s", mint, e)
+        return FilterResult(passed=False, skip_reason="rugcheck_unexpected_error")
 
     score = float(data.get("score_normalised", data.get("score", 0)))
     if score > threshold_score:
@@ -306,10 +309,22 @@ async def run_safety_filters(ctx: FilterContext) -> FilterResult:
 
     The aggregate `metrics` dict on a passing result is the union of every
     filter's individual metrics — useful for logging to the trade row at buy time.
+
+    Fail-closed: if any filter itself raises an unhandled exception, treat the
+    token as rejected (filter_internal_error). Better to skip a possibly-good
+    token than to trade on uninspected state.
     """
     aggregate_metrics: dict[str, Any] = {}
     for filter_fn in FILTER_PIPELINE:
-        result = await filter_fn(ctx)
+        try:
+            result = await filter_fn(ctx)
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Filter %s raised: %s", filter_fn.__name__, e)
+            return FilterResult(
+                passed=False,
+                skip_reason=f"filter_internal_error_{filter_fn.__name__}",
+                metrics=aggregate_metrics,
+            )
         if result.metrics:
             aggregate_metrics.update(result.metrics)
         if not result.passed:

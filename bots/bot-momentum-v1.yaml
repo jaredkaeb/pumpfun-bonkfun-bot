@@ -1,0 +1,79 @@
+# AI Strategy Manager test bot.
+#
+# This YAML maps one bot process to one strategy in the Strategy Manager's
+# adaptive_strategy_config.json. The bot reads pause flags, blacklists, and
+# safety-filter thresholds from that config on every token evaluation.
+#
+# For the first integration test:
+#   - listener_type: "logs"     (works with just RPC/WSS, no Geyser needed)
+#   - buy_amount: very small    (we'll fund the wallet with a tiny amount)
+#   - paper_trade: false        (real chain, but we control risk via small amount)
+#   - enabled: false            (flip to true when you're ready to run it)
+
+# Bot identification and Strategy Manager wiring
+name: "bot-momentum-v1"
+strategy_id: "momentum_v1"  # must match a strategy in adaptive_strategy_config.json
+paper_trade: false
+
+env_file: ".env"
+rpc_endpoint: "${SOLANA_NODE_RPC_ENDPOINT}"
+wss_endpoint: "${SOLANA_NODE_WSS_ENDPOINT}"
+private_key: "${SOLANA_PRIVATE_KEY}"
+
+enabled: true  # AI integration dry test
+separate_process: false
+
+# Platform
+platform: "pump_fun"
+
+# Trading parameters — kept tiny for first live test.
+# 0.001 SOL ≈ $0.15 at $150/SOL. If anything goes wrong, the max loss per trade
+# is roughly a quarter. Increase only after we verify the loop works.
+trade:
+  buy_amount: 0.001
+  buy_slippage: 0.30
+  sell_slippage: 0.30
+
+  exit_strategy: "tp_sl"     # use take-profit / stop-loss so we exercise the position monitor
+  take_profit_percentage: 0.40
+  stop_loss_percentage: 0.25
+  max_hold_time: 60
+  price_check_interval: 2
+
+  # Disable extreme_fast_mode for the first test so we wait long enough for the
+  # curve to be readable by our safety filters (liquidity, market cap).
+  extreme_fast_mode: false
+  extreme_fast_token_amount: 20
+
+priority_fees:
+  enable_dynamic: false
+  enable_fixed: true
+  fixed_amount: 200_000
+  extra_percentage: 0.0
+  hard_cap: 200_000
+
+# Filter configuration. NOTE: the Strategy Manager's adaptive_strategy_config.json
+# is what actually controls min_liquidity/max_market_cap/rug_risk_threshold via
+# our safety_filters module. The values below are the bot's OWN minimal filters
+# that still apply (token age, match string, mode flags).
+filters:
+  match_string: null
+  bro_address: null
+  listener_type: "logs"   # only needs RPC + WSS, no Geyser signup required
+  max_token_age: 30       # process tokens up to 30s old (lenient — we want to see traffic)
+  marry_mode: false
+  yolo_mode: true         # keep processing tokens instead of exiting after one
+
+retries:
+  max_attempts: 1
+  wait_after_creation: 8
+  wait_after_buy: 10
+  wait_before_new_token: 15
+
+cleanup:
+  mode: "on_fail"
+  force_close_with_burn: false
+  with_priority_fee: false
+
+node:
+  max_rps: 25

@@ -884,11 +884,16 @@ class UniversalTrader:
                         logger.error(
                             f"Failed to exit position: {sell_result.error_message}"
                         )
-                        # AI Strategy Manager: log the failed-exit attempt but don't
-                        # remove from _open_trade_rows yet — monitoring continues.
-                        # The row stays open until either a retry succeeds or the
-                        # process restarts.
-                        # Keep monitoring in case sell can be retried
+                        # AI Strategy Manager: the loop break below ends monitoring,
+                        # so we MUST close out the open trade row here or it stays
+                        # phantom-open forever. Marking failed_exit=True is the
+                        # critical signal Claude uses to weight a strategy as broken.
+                        await self._record_trade_close(
+                            token_info=token_info,
+                            exit_price_usd=0.0,
+                            exit_reason="failed_exit",
+                            failed_exit=True,
+                        )
 
                     break
                 else:
