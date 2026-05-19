@@ -60,15 +60,15 @@ filters:
   match_string: null
   bro_address: null
   listener_type: "logs"   # only needs RPC + WSS, no Geyser signup required
-  max_token_age: 30       # process tokens up to 30s old (lenient — we want to see traffic)
+  max_token_age: 60       # raised from 30: queue throughput was the bottleneck
   marry_mode: false
   yolo_mode: true         # keep processing tokens instead of exiting after one
 
 retries:
   max_attempts: 1
-  wait_after_creation: 8
+  wait_after_creation: 3   # lowered from 8: process more tokens before they age out
   wait_after_buy: 10
-  wait_before_new_token: 15
+  wait_before_new_token: 5  # lowered from 15: don't sit idle in yolo_mode
 
 cleanup:
   mode: "on_fail"
