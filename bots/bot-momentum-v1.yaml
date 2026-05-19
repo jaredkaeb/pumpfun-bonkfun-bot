@@ -48,9 +48,17 @@ trade:
 priority_fees:
   enable_dynamic: false
   enable_fixed: true
-  fixed_amount: 200_000
+  fixed_amount: 500_000   # raised from 200k: improve tx land-rate for sells
   extra_percentage: 0.0
-  hard_cap: 200_000
+  hard_cap: 500_000
+
+# Compute unit overrides — DAY 2 FIX: yesterday both sells failed with
+# ComputationalBudgetExceeded. The default 60k sell budget was set before
+# pump.fun's 2026-04-28 upgrade added 1-2 accounts to the sell instruction.
+# Bumping sell to 120k and buy to 150k for headroom.
+compute_units:
+  buy: 150_000
+  sell: 120_000
 
 # Filter configuration. NOTE: the Strategy Manager's adaptive_strategy_config.json
 # is what actually controls min_liquidity/max_market_cap/rug_risk_threshold via
