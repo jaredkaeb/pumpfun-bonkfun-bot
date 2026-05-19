@@ -106,6 +106,10 @@ class UniversalTrader:
         compute_units: dict | None = None,
         # Node provider configuration
         max_rps: float = 25.0,
+        # Patient listener config — only used when listener_type == "patient"
+        patient_min_age_seconds: int = 300,
+        patient_max_age_seconds: int = 1800,
+        patient_scan_interval_seconds: int = 30,
     ):
         """Initialize the universal trader."""
         # Core components
@@ -177,6 +181,10 @@ class UniversalTrader:
             geyser_auth_type=geyser_auth_type,
             pumpportal_url=pumpportal_url,
             platforms=[self.platform],  # Only listen for our platform
+            # Patient listener config — only relevant when listener_type=="patient"
+            patient_min_age_seconds=patient_min_age_seconds,
+            patient_max_age_seconds=patient_max_age_seconds,
+            patient_scan_interval_seconds=patient_scan_interval_seconds,
         )
 
         # Trading parameters

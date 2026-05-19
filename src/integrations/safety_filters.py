@@ -30,6 +30,18 @@ logger = logging.getLogger(__name__)
 LAMPORTS_PER_SOL = 1_000_000_000
 TOKEN_DECIMALS = 6  # pump.fun standard
 
+# Pump.fun bonding curve genesis constants. Every newly-created pump.fun token
+# starts with these reserves; price grows from there as buys flow in.
+# Source: pump-public-docs and verified empirically on-chain.
+PUMP_FUN_INITIAL_VIRTUAL_SOL_RESERVES = 30_000_000_000        # 30 SOL in lamports
+PUMP_FUN_INITIAL_VIRTUAL_TOKEN_RESERVES = 1_073_000_191_000_000  # 1.073B tokens raw
+PUMP_FUN_LAUNCH_PRICE_SOL_PER_TOKEN = (
+    PUMP_FUN_INITIAL_VIRTUAL_SOL_RESERVES
+    / PUMP_FUN_INITIAL_VIRTUAL_TOKEN_RESERVES
+    * (10**TOKEN_DECIMALS)
+    / LAMPORTS_PER_SOL
+)  # ≈ 2.796e-8 SOL per whole token at genesis
+
 # SOL/USD price cache — refresh every PRICE_CACHE_TTL seconds.
 PRICE_CACHE_TTL = 60.0
 _sol_price_usd: float | None = None
@@ -51,6 +63,53 @@ class FilterContext:
     pool_address: Any  # Pubkey of the bonding curve
     curve_manager: Any  # PumpFunCurveManager — fetches pool state
     filters_config: dict[str, Any]  # the Strategy Manager's filter dict
+
+
+# --------------------------------------------------------------------------------------
+# Filter 0: token age window (strategy-level age check)
+# --------------------------------------------------------------------------------------
+
+async def filter_token_age(ctx: FilterContext) -> FilterResult:
+    """Enforce the strategy's min/max age window using TokenInfo.creation_timestamp.
+
+    The bot's existing `max_token_age` (in YAML) is a queue-staleness check — it
+    catches tokens that aged out of OUR queue between detection and processing.
+    This filter is different: it enforces the STRATEGY's age window, e.g. for
+    patient_v1 (only buy tokens 5-30 min old). Without this, the bot would
+    process every fresh token regardless of strategy.
+
+    Uses TokenInfo.creation_timestamp which is the on-chain CreateEvent timestamp.
+    """
+    min_age = ctx.filters_config.get("min_token_age_seconds")
+    max_age = ctx.filters_config.get("max_token_age_seconds")
+    if min_age is None and max_age is None:
+        return FilterResult(passed=True)
+
+    ts = getattr(ctx.token_info, "creation_timestamp", None)
+    if ts is None or ts <= 0:
+        # No on-chain timestamp — fail closed for strategies that care
+        return FilterResult(
+            passed=False,
+            skip_reason="token_age_unknown",
+        )
+
+    import time as _time
+    age_seconds = _time.time() - float(ts)
+
+    if min_age is not None and age_seconds < min_age:
+        return FilterResult(
+            passed=False,
+            skip_reason="token_age_below_min",
+            metrics={"token_age_seconds": age_seconds, "min_required": min_age},
+        )
+    if max_age is not None and age_seconds > max_age:
+        return FilterResult(
+            passed=False,
+            skip_reason="token_age_above_max",
+            metrics={"token_age_seconds": age_seconds, "max_allowed": max_age},
+        )
+
+    return FilterResult(passed=True, metrics={"token_age_seconds": age_seconds})
 
 
 # --------------------------------------------------------------------------------------
@@ -163,6 +222,105 @@ async def filter_market_cap_ceiling(ctx: FilterContext) -> FilterResult:
     except Exception as e:  # noqa: BLE001
         logger.warning("market_cap_ceiling check failed: %s", e)
         return FilterResult(passed=False, skip_reason="market_cap_check_failed")
+
+
+# --------------------------------------------------------------------------------------
+# Filter 3a: don't buy if curve has already pumped beyond launch
+# --------------------------------------------------------------------------------------
+
+async def filter_not_already_pumped(ctx: FilterContext) -> FilterResult:
+    """Skip tokens whose price is already > max_price_ratio_from_launch × launch price.
+
+    The single biggest reason our snipes lost ~90% per trade: by the time we
+    were broadcasting a buy, faster snipers had already pumped the curve 50-150%
+    above launch. We were the exit liquidity. This filter says: if the curve
+    has already moved more than we tolerate from genesis, the snipe window has
+    closed — skip.
+
+    Threshold semantics: filters_config["max_price_ratio_from_launch"] is a
+    multiplier (e.g. 1.5 means "skip if current price > 1.5x launch price").
+    Disabled if absent.
+    """
+    max_ratio = ctx.filters_config.get("max_price_ratio_from_launch")
+    if max_ratio is None:
+        return FilterResult(passed=True)
+
+    try:
+        state = await ctx.curve_manager.get_pool_state(ctx.pool_address)
+        virt_token = state["virtual_token_reserves"]
+        virt_sol = state["virtual_sol_reserves"]
+        if virt_token <= 0 or virt_sol <= 0:
+            return FilterResult(
+                passed=False,
+                skip_reason="invalid_curve_state",
+                metrics={"virt_token": virt_token, "virt_sol": virt_sol},
+            )
+
+        current_price_sol_per_token = (
+            (virt_sol / virt_token) * (10**TOKEN_DECIMALS) / LAMPORTS_PER_SOL
+        )
+        ratio = current_price_sol_per_token / PUMP_FUN_LAUNCH_PRICE_SOL_PER_TOKEN
+
+        if ratio > max_ratio:
+            return FilterResult(
+                passed=False,
+                skip_reason="already_pumped",
+                metrics={
+                    "price_ratio_from_launch": ratio,
+                    "max_allowed_ratio": max_ratio,
+                },
+            )
+        return FilterResult(
+            passed=True,
+            metrics={"price_ratio_from_launch": ratio},
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("not_already_pumped check failed: %s", e)
+        return FilterResult(passed=False, skip_reason="pumped_check_failed")
+
+
+# --------------------------------------------------------------------------------------
+# Filter 3b: require substantive real SOL in the curve (not just creator + bots)
+# --------------------------------------------------------------------------------------
+
+async def filter_substantive_curve_liquidity(ctx: FilterContext) -> FilterResult:
+    """Skip tokens whose curve has < min_real_sol_reserves_sol of REAL SOL.
+
+    Pump.fun virtual reserves are an accounting trick; real_sol_reserves is the
+    actual SOL deposited by buyers. A curve with <2 SOL real liquidity is either
+    creator-only or a microcap that no one outside the sniper bot pool has
+    touched — both correlate with immediate dumps.
+
+    Distinct from filter_liquidity_floor which checks USD value of liquidity.
+    This filter checks SOL count directly (decoupled from SOL price), which is
+    a better proxy for "real buyer interest" — a $300 USD position at $84/SOL
+    is 3.6 SOL, healthy real interest; a $300 position at $300/SOL is 1 SOL,
+    creator-only.
+    """
+    min_real_sol = ctx.filters_config.get("min_real_sol_reserves_sol")
+    if min_real_sol is None:
+        return FilterResult(passed=True)
+
+    try:
+        state = await ctx.curve_manager.get_pool_state(ctx.pool_address)
+        real_sol = state.get("real_sol_reserves", 0) / LAMPORTS_PER_SOL
+
+        if real_sol < min_real_sol:
+            return FilterResult(
+                passed=False,
+                skip_reason="real_sol_below_min",
+                metrics={
+                    "real_sol_reserves": real_sol,
+                    "min_required_sol": min_real_sol,
+                },
+            )
+        return FilterResult(
+            passed=True,
+            metrics={"real_sol_reserves": real_sol},
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("substantive_curve_liquidity check failed: %s", e)
+        return FilterResult(passed=False, skip_reason="real_sol_check_failed")
 
 
 # --------------------------------------------------------------------------------------
@@ -294,13 +452,18 @@ async def get_sol_price_usd() -> float:
 # Orchestrator — run all enabled filters in order, short-circuit on first failure
 # --------------------------------------------------------------------------------------
 
-# Order matters: cheapest filters first so we can fail fast.
+# Order matters: cheapest filters first, slowest (HTTP) last.
+# filter_token_age runs FIRST because it's pure-Python and is the most natural
+# gate for patient_v1 strategy.
 FILTER_PIPELINE = [
+    filter_token_age,                    # strategy-level age window
     filter_curve_not_complete,
     filter_liquidity_floor,
     filter_market_cap_ceiling,
-    filter_simulated_sell,  # stub — always passes for pump.fun
-    filter_rugcheck,  # slowest (HTTP), runs last
+    filter_not_already_pumped,           # smart-snipe v1: skip post-pump tokens
+    filter_substantive_curve_liquidity,  # smart-snipe v1: require real buyer interest
+    filter_simulated_sell,               # stub — always passes for pump.fun
+    filter_rugcheck,                     # slowest (HTTP), runs last
 ]
 
 

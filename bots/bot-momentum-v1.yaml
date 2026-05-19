@@ -20,7 +20,7 @@ rpc_endpoint: "${SOLANA_NODE_RPC_ENDPOINT}"
 wss_endpoint: "${SOLANA_NODE_WSS_ENDPOINT}"
 private_key: "${SOLANA_PRIVATE_KEY}"
 
-enabled: true  # AI integration dry test
+enabled: false # snipe paused — pivoting to patient_v1
 separate_process: false
 
 # Platform
@@ -30,7 +30,7 @@ platform: "pump_fun"
 # 0.001 SOL ≈ $0.15 at $150/SOL. If anything goes wrong, the max loss per trade
 # is roughly a quarter. Increase only after we verify the loop works.
 trade:
-  buy_amount: 0.001
+  buy_amount: 0.003   # ~$0.25 per trade — small enough to control burn, big enough to see real PnL
   buy_slippage: 0.30
   sell_slippage: 0.30
 

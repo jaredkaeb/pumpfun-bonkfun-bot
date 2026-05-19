@@ -157,6 +157,10 @@ async def start_bot(config_path: str):
             compute_units=cfg.get("compute_units", {}),
             # Node provider configuration
             max_rps=cfg.get("node", {}).get("max_rps", 25),
+            # Patient listener configuration (only used when listener_type == "patient")
+            patient_min_age_seconds=cfg.get("patient", {}).get("min_age_seconds", 300),
+            patient_max_age_seconds=cfg.get("patient", {}).get("max_age_seconds", 1800),
+            patient_scan_interval_seconds=cfg.get("patient", {}).get("scan_interval_seconds", 30),
         )
 
         await trader.start()

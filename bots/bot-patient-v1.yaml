@@ -1,0 +1,85 @@
+# Patient bot — buys tokens 5-30 min old that survived the launch dump.
+#
+# Thesis: fresh-launch sniping at retail scale is -EV (data: 4 trades, 0 wins).
+# Most pump.fun launches die within 2-3 minutes. Tokens that are still on the
+# bonding curve and have substantive liquidity 5+ minutes in have demonstrated
+# some kind of survival signal. We buy those instead of fresh launches.
+#
+# Bot identification and Strategy Manager wiring
+name: "bot-patient-v1"
+strategy_id: "patient_v1"   # must match a strategy in adaptive_strategy_config.json
+paper_trade: false
+
+env_file: ".env"
+rpc_endpoint: "${SOLANA_NODE_RPC_ENDPOINT}"
+wss_endpoint: "${SOLANA_NODE_WSS_ENDPOINT}"
+private_key: "${SOLANA_PRIVATE_KEY}"
+
+enabled: true   # patient_v1 listener test
+separate_process: false
+
+# Platform
+platform: "pump_fun"
+
+# Trading parameters — same small sizing as smart-snipe test
+trade:
+  buy_amount: 0.003          # ~$0.25 per trade
+  buy_slippage: 0.20         # tighter slippage; mature tokens move less violently
+  sell_slippage: 0.20
+
+  exit_strategy: "tp_sl"
+  take_profit_percentage: 0.20    # +20% take profit (more realistic for mature tokens)
+  stop_loss_percentage: 0.15      # -15% stop loss (tighter — these shouldn't move as much)
+  max_hold_time: 180              # hold up to 3 min (vs 60s for snipe)
+  price_check_interval: 3
+
+  # No extreme fast mode — the whole point is patience
+  extreme_fast_mode: false
+  extreme_fast_token_amount: 0
+
+# Priority fees — bumped from smart-snipe defaults for safety
+priority_fees:
+  enable_dynamic: false
+  enable_fixed: true
+  fixed_amount: 500_000
+  extra_percentage: 0.0
+  hard_cap: 500_000
+
+compute_units:
+  buy: 150_000
+  sell: 120_000
+
+# Filter configuration. NOTE: the actual liquidity/mcap/rug thresholds live in
+# the Strategy Manager's adaptive_strategy_config.json under "patient_v1".
+# These bot-side filters are bot-internal (max_token_age is queue staleness,
+# not strategy age).
+filters:
+  match_string: null
+  bro_address: null
+  listener_type: "patient"   # ← the new listener we just built
+  max_token_age: 3600        # generous — patient listener will dispatch tokens up to 30 min old
+  marry_mode: false
+  yolo_mode: true
+
+# Patient listener configuration
+# These define the WATCH WINDOW. Tokens are added to a watchlist on creation,
+# then dispatched when their age enters [min_age_seconds, max_age_seconds].
+# Tokens older than max_age_seconds are evicted without dispatch.
+patient:
+  min_age_seconds: 300        # wait 5 min before considering a token
+  max_age_seconds: 1800       # don't watch beyond 30 min
+  scan_interval_seconds: 30   # check watchlist every 30 sec
+
+retries:
+  max_attempts: 1
+  wait_after_creation: 3      # only 3 sec — by dispatch time the curve is fully stable
+  wait_after_buy: 10
+  wait_before_new_token: 5
+
+cleanup:
+  mode: "on_fail"
+  force_close_with_burn: false
+  with_priority_fee: false
+
+node:
+  max_rps: 25

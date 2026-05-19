@@ -21,6 +21,10 @@ class ListenerFactory:
         geyser_auth_type: str = "x-token",
         pumpportal_url: str = "wss://pumpportal.fun/api/data",
         platforms: list[Platform] | None = None,
+        # Patient listener config (only used when listener_type == "patient")
+        patient_min_age_seconds: int = 300,
+        patient_max_age_seconds: int = 1800,
+        patient_scan_interval_seconds: int = 30,
     ) -> BaseTokenListener:
         """Create a token listener based on the specified type.
 
@@ -121,10 +125,35 @@ class ListenerFactory:
             )
             return listener
 
+        elif listener_type == "patient":
+            # Patient listener wraps the logs listener but defers callbacks
+            # until tokens have aged into [min_age, max_age] window. Used by
+            # patient_v1 strategy to buy mature tokens that survived launch.
+            if wss_endpoint is None:
+                raise ValueError("wss_endpoint is required for 'patient' listener")
+            from monitoring.universal_patient_listener import UniversalPatientListener
+
+            listener = UniversalPatientListener(
+                wss_endpoint=wss_endpoint,
+                platforms=platforms,
+                patient_min_age_seconds=patient_min_age_seconds,
+                patient_max_age_seconds=patient_max_age_seconds,
+                scan_interval_seconds=patient_scan_interval_seconds,
+            )
+            logger.info(
+                "Created Universal Patient listener (min_age=%ds max_age=%ds scan=%ds) "
+                "for platforms: %s",
+                patient_min_age_seconds,
+                patient_max_age_seconds,
+                patient_scan_interval_seconds,
+                [p.value for p in (platforms or [])],
+            )
+            return listener
+
         else:
             raise ValueError(
                 f"Invalid listener type '{listener_type}'. "
-                f"Must be one of: 'logs', 'blocks', 'geyser', 'pumpportal'"
+                f"Must be one of: 'logs', 'blocks', 'geyser', 'pumpportal', 'patient'"
             )
 
     @staticmethod
@@ -134,7 +163,7 @@ class ListenerFactory:
         Returns:
             List of supported listener type strings
         """
-        return ["logs", "blocks", "geyser", "pumpportal"]
+        return ["logs", "blocks", "geyser", "pumpportal", "patient"]
 
     @staticmethod
     def get_platform_compatible_listeners(platform: Platform) -> list[str]:
@@ -147,7 +176,7 @@ class ListenerFactory:
             List of compatible listener types
         """
         if platform == Platform.PUMP_FUN:
-            return ["logs", "blocks", "geyser", "pumpportal"]
+            return ["logs", "blocks", "geyser", "pumpportal", "patient"]
         elif platform == Platform.LETS_BONK:
             return ["blocks", "geyser", "pumpportal"]  # Added pumpportal support
         else:
