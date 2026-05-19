@@ -74,7 +74,7 @@ filters:
 
 retries:
   max_attempts: 1
-  wait_after_creation: 3   # lowered from 8: process more tokens before they age out
+  wait_after_creation: 12  # let liquidity accumulate so the $3k filter has tokens to pass
   wait_after_buy: 10
   wait_before_new_token: 5  # lowered from 15: don't sit idle in yolo_mode
 

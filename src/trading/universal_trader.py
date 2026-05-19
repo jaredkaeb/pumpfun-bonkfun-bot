@@ -226,12 +226,18 @@ class UniversalTrader:
         self.strategy_id: str = strategy_id
         self.is_paper_trade: bool = is_paper_trade
         self.strategy_config = get_strategy_config()
-        # Maps mint string -> (db_trade_id, buy_timestamp_monotonic, entry_price)
-        # so we can update the row on sell with PnL and time-in-trade.
-        self._open_trade_rows: dict[str, tuple[int, float, float]] = {}
+        # Maps mint string -> (db_trade_id, buy_ts_monotonic, entry_price,
+        # sol_price_at_buy_usd, balance_before_sol). Last field is the wallet's
+        # SOL balance captured BEFORE the buy — post-sell balance minus this
+        # equals the true PnL including gas, slippage, ATA creation, everything.
+        self._open_trade_rows: dict[
+            str, tuple[int, float, float, float, float]
+        ] = {}
         # Filter metrics from the most recent run_safety_filters call, passed
         # from _handle_token into _handle_successful_buy.
         self._pending_trade_metrics: dict[str, Any] = {}
+        # Pre-buy SOL balance captured for the trade currently in flight.
+        self._pending_balance_before_sol: float = 0.0
 
     async def start(self) -> None:
         """Start the trading bot and listen for new tokens."""
@@ -556,6 +562,13 @@ class UniversalTrader:
             # Stash the filter metrics so we can attach them to the trade row on buy.
             self._pending_trade_metrics = filter_result.metrics or {}
 
+            # AI Strategy Manager: capture wallet SOL balance BEFORE the buy.
+            # The delta between this and the post-sell balance is the TRUE
+            # round-trip PnL — including gas, slippage, ATA creation, and the
+            # actual trade outcome. Replaces the buggy sell_result.price math
+            # that always reported 0% PnL.
+            self._pending_balance_before_sol = await self._get_wallet_sol_balance()
+
             # Buy token
             logger.info(
                 f"Buying {self.buy_amount:.6f} SOL worth of {token_info.symbol} on {token_info.platform.value}..."
@@ -632,12 +645,13 @@ class UniversalTrader:
                 is_paper_trade=self.is_paper_trade,
             )
             if db_trade_id is not None:
-                # 4-tuple: (db_id, buy_ts_monotonic, entry_price_sol, sol_price_at_buy_usd)
+                # 5-tuple: (db_id, buy_ts, entry_price_sol, sol_price_usd, balance_before_sol)
                 self._open_trade_rows[mint_str] = (
                     db_trade_id,
                     monotonic(),
                     buy_result.price or 0.0,
                     sol_price_for_trade,
+                    self._pending_balance_before_sol,
                 )
         except Exception:
             logger.exception("Strategy DB: failed to record open trade for %s", mint_str)
@@ -787,21 +801,48 @@ class UniversalTrader:
             )
             return
 
-        trade_id, buy_ts, entry_price, sol_price_at_buy = rec
+        trade_id, buy_ts, entry_price, sol_price_at_buy, balance_before_sol = rec
         time_in_trade = int(monotonic() - buy_ts)
-
-        # Convert pnl to USD using the same sol_price snapshot we used at buy
-        # (consistent units across buy and sell of one trade). buy_amount is in
-        # SOL, so multiply by sol_price to get the dollar value of the position.
         position_size_usd = self.buy_amount * sol_price_at_buy
 
-        if failed_exit or exit_price_usd <= 0 or entry_price <= 0:
-            pnl_usd = -position_size_usd  # full-loss in USD terms
-            pnl_percent = -100.0
+        # TRUE PnL via wallet SOL balance delta. This is the only honest measure:
+        # it includes gas, ATA creation/cleanup, slippage on both buy and sell,
+        # and the actual trade outcome. The Chainstack bot's sell_result.price
+        # mirrors entry_price (a quirk of how the Seller is wired) and would
+        # always report 0% PnL — useless for strategy analysis.
+        balance_after_sol = await self._get_wallet_sol_balance()
+        delta_sol = balance_after_sol - balance_before_sol  # negative = lost SOL
+        pnl_usd = delta_sol * sol_price_at_buy
+        # pnl_percent = return on position size (delta vs the SOL we put in)
+        if self.buy_amount > 0:
+            pnl_percent = (delta_sol / self.buy_amount) * 100
         else:
-            # pnl% derived from SOL/token entry vs SOL/token exit (units cancel)
-            pnl_percent = (exit_price_usd - entry_price) / entry_price * 100
-            pnl_usd = position_size_usd * (pnl_percent / 100)
+            pnl_percent = 0.0
+
+        # Sanity overrides — if we genuinely couldn't get a balance reading or
+        # the trade closed in a degenerate state, keep the prior behavior.
+        if balance_before_sol <= 0 or balance_after_sol <= 0:
+            logger.warning(
+                "Wallet balance lookup failed; falling back to position-size full-loss for %s",
+                mint_str,
+            )
+            if failed_exit:
+                pnl_usd = -position_size_usd
+                pnl_percent = -100.0
+            else:
+                pnl_usd = 0.0
+                pnl_percent = 0.0
+
+        logger.info(
+            "True PnL for %s: delta_sol=%.6f, pnl_usd=$%.4f, pnl_pct=%.2f%%, "
+            "reason=%s, failed_exit=%s",
+            mint_str[:12],
+            delta_sol,
+            pnl_usd,
+            pnl_percent,
+            exit_reason,
+            failed_exit,
+        )
 
         try:
             await strategy_db.update_trade_close(
@@ -928,6 +969,28 @@ class UniversalTrader:
                 await asyncio.sleep(
                     self.price_check_interval
                 )  # Continue monitoring despite errors
+
+    async def _get_wallet_sol_balance(self) -> float:
+        """AI Strategy Manager: fetch the wallet's native SOL balance in SOL units.
+
+        Used by the true-PnL flow: balance_before_buy minus balance_after_sell
+        gives the real round-trip outcome including gas, slippage, ATA creation,
+        and the actual trade. Returns 0.0 on any failure — the caller treats
+        zero as 'no signal' and falls back to position-size accounting.
+        """
+        try:
+            body = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getBalance",
+                "params": [str(self.wallet.pubkey)],
+            }
+            resp = await self.solana_client.post_rpc(body)
+            if resp and "result" in resp and "value" in resp["result"]:
+                return resp["result"]["value"] / 1_000_000_000
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to fetch wallet SOL balance")
+        return 0.0
 
     def _get_pool_address(self, token_info: TokenInfo) -> Pubkey:
         """Get the pool/curve address for price monitoring using platform-agnostic method."""
