@@ -9,6 +9,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from time import monotonic
+from typing import Any
 
 from solders.pubkey import Pubkey
 
@@ -228,6 +229,9 @@ class UniversalTrader:
         # Maps mint string -> (db_trade_id, buy_timestamp_monotonic, entry_price)
         # so we can update the row on sell with PnL and time-in-trade.
         self._open_trade_rows: dict[str, tuple[int, float, float]] = {}
+        # Filter metrics from the most recent run_safety_filters call, passed
+        # from _handle_token into _handle_successful_buy.
+        self._pending_trade_metrics: dict[str, Any] = {}
 
     async def start(self) -> None:
         """Start the trading bot and listen for new tokens."""
@@ -508,6 +512,50 @@ class UniversalTrader:
                 )
                 await asyncio.sleep(self.wait_time_after_creation)
 
+            # AI Strategy Manager: run safety filters BEFORE buying.
+            # Resolve the strategy's filter config from JSON every cycle so Claude's
+            # tuned thresholds (liquidity floor, mcap ceiling, rug threshold) apply.
+            decision = self.strategy_config.get_strategy(self.strategy_id)
+            if decision is None:
+                logger.info(
+                    "Strategy '%s' is not active. Skipping %s.",
+                    self.strategy_id,
+                    token_info.symbol,
+                )
+                await strategy_db.insert_skipped_token(
+                    strategy_id=self.strategy_id,
+                    token_address=mint_str,
+                    skip_reason="strategy_not_active",
+                )
+                return
+
+            # Lazy import to avoid a hard dependency cycle at module load time.
+            from integrations.safety_filters import FilterContext, run_safety_filters
+
+            filter_ctx = FilterContext(
+                token_info=token_info,
+                pool_address=self._get_pool_address(token_info),
+                curve_manager=self.platform_implementations.curve_manager,
+                filters_config=decision.filters,
+            )
+            filter_result = await run_safety_filters(filter_ctx)
+            if not filter_result.passed:
+                metrics_str = ""
+                if filter_result.metrics:
+                    metrics_str = "; ".join(
+                        f"{k}={v}" for k, v in filter_result.metrics.items()
+                    )
+                await strategy_db.insert_skipped_token(
+                    strategy_id=self.strategy_id,
+                    token_address=mint_str,
+                    skip_reason=filter_result.skip_reason or "safety_filter_failed",
+                    notes=metrics_str[:500] if metrics_str else None,
+                )
+                return
+
+            # Stash the filter metrics so we can attach them to the trade row on buy.
+            self._pending_trade_metrics = filter_result.metrics or {}
+
             # Buy token
             logger.info(
                 f"Buying {self.buy_amount:.6f} SOL worth of {token_info.symbol} on {token_info.platform.value}..."
@@ -544,16 +592,33 @@ class UniversalTrader:
             buy_result.tx_signature,
         )
 
-        # AI Strategy Manager: write the open trade row, remember the id for close.
-        # position_size_usd is the SOL spent × SOL price — we don't have SOL price here,
-        # so we use buy_amount (SOL) as a stand-in until Phase 2 wires in a price feed.
+        # AI Strategy Manager: write the open trade row with whatever metrics the
+        # safety filters computed at evaluation time (liquidity, mcap, rugcheck score).
         mint_str = str(token_info.mint)
+        metrics = getattr(self, "_pending_trade_metrics", {}) or {}
+
+        # Convert position size from SOL to USD using the SOL price we already cached
+        position_size_usd = self.buy_amount
+        try:
+            from integrations.safety_filters import get_sol_price_usd
+            sol_price = await get_sol_price_usd()
+            position_size_usd = self.buy_amount * sol_price
+        except Exception:  # noqa: BLE001
+            logger.debug("SOL price unavailable; storing position_size in SOL units")
+
         try:
             db_trade_id = await strategy_db.insert_trade_open(
                 strategy_id=self.strategy_id,
                 token_address=mint_str,
                 entry_price_usd=buy_result.price or 0.0,
-                position_size_usd=self.buy_amount,  # SOL units for now; convert in Phase 2
+                position_size_usd=position_size_usd,
+                liquidity_at_entry_usd=metrics.get("liquidity_usd"),
+                market_cap_at_entry_usd=metrics.get("market_cap_usd"),
+                rug_risk_score_at_entry=(
+                    metrics.get("rugcheck_score") / 100
+                    if isinstance(metrics.get("rugcheck_score"), (int, float))
+                    else None
+                ),
                 is_paper_trade=self.is_paper_trade,
             )
             if db_trade_id is not None:
@@ -564,6 +629,8 @@ class UniversalTrader:
                 )
         except Exception:
             logger.exception("Strategy DB: failed to record open trade for %s", mint_str)
+        finally:
+            self._pending_trade_metrics = {}
 
         self.traded_mints.add(token_info.mint)
         # Track token program for cleanup
