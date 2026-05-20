@@ -172,6 +172,16 @@ class UniversalTrader:
             compute_units=self.compute_units,
         )
 
+        # Jupiter trader handles migrated tokens (post-PumpSwap). Routed via
+        # additional_data["migration"] flag set by UniversalMigrationListener.
+        from integrations.jupiter_trader import JupiterTrader
+        self.jupiter_trader = JupiterTrader(
+            client=self.solana_client,
+            wallet=self.wallet,
+            slippage_bps=int(buy_slippage * 10000),  # 0.30 → 3000 bps
+            prioritization_fee_lamports=fixed_priority_fee,
+        )
+
         # Initialize the appropriate listener with platform filtering
         self.token_listener = ListenerFactory.create_listener(
             listener_type=listener_type,
@@ -581,7 +591,7 @@ class UniversalTrader:
             logger.info(
                 f"Buying {self.buy_amount:.6f} SOL worth of {token_info.symbol} on {token_info.platform.value}..."
             )
-            buy_result: TradeResult = await self.buyer.execute(token_info)
+            buy_result: TradeResult = await self._execute_buy(token_info)
 
             if buy_result.success:
                 await self._handle_successful_buy(token_info, buy_result)
@@ -745,7 +755,7 @@ class UniversalTrader:
 
         logger.info(f"Selling {token_info.symbol}...")
         # Pass token amount and price from buy result to avoid RPC delays
-        sell_result: TradeResult = await self.seller.execute(
+        sell_result: TradeResult = await self._execute_sell(
             token_info, token_amount=buy_result.amount, token_price=buy_result.price
         )
 
@@ -900,7 +910,7 @@ class UniversalTrader:
                     )
 
                     # Execute sell with position quantity and entry price to avoid RPC delays
-                    sell_result = await self.seller.execute(
+                    sell_result = await self._execute_sell(
                         token_info,
                         token_amount=position.quantity,
                         token_price=position.entry_price,
@@ -999,6 +1009,44 @@ class UniversalTrader:
         except Exception:  # noqa: BLE001
             logger.exception("Failed to fetch wallet SOL balance")
         return 0.0
+
+    # ---- AI Strategy Manager: route buys/sells based on token type ------------
+
+    @staticmethod
+    def _is_migrated(token_info: TokenInfo) -> bool:
+        """Check if this token came from the migration listener."""
+        return bool((token_info.additional_data or {}).get("migration"))
+
+    async def _execute_buy(self, token_info: TokenInfo) -> TradeResult:
+        """Route buy to Jupiter for migrated tokens, bonding curve buyer otherwise."""
+        if self._is_migrated(token_info):
+            sol_lamports = int(self.buy_amount * 1_000_000_000)
+            logger.info(
+                "Routing buy via Jupiter (migrated token, %.6f SOL)", self.buy_amount
+            )
+            return await self.jupiter_trader.buy(token_info, sol_lamports)
+        return await self.buyer.execute(token_info)
+
+    async def _execute_sell(
+        self,
+        token_info: TokenInfo,
+        token_amount: float,
+        token_price: float,
+    ) -> TradeResult:
+        """Route sell to Jupiter for migrated tokens, bonding curve seller otherwise.
+
+        token_amount is in DECIMAL token units (e.g. 1234.567). For Jupiter we
+        convert to raw smallest-unit integer using pump.fun's 6-decimal standard.
+        """
+        if self._is_migrated(token_info):
+            raw_amount = int(token_amount * (10**6))  # pump.fun TOKEN_DECIMALS
+            logger.info(
+                "Routing sell via Jupiter (migrated token, %.4f tokens)", token_amount
+            )
+            return await self.jupiter_trader.sell(token_info, raw_amount)
+        return await self.seller.execute(
+            token_info, token_amount=token_amount, token_price=token_price
+        )
 
     def _get_pool_address(self, token_info: TokenInfo) -> Pubkey:
         """Get the pool/curve address for price monitoring using platform-agnostic method."""

@@ -1,0 +1,69 @@
+# Migrated-token trader. Catches pump.fun tokens that just graduated to PumpSwap
+# (which by definition have $80K+ of locked liquidity) and trades them via Jupiter
+# aggregator. Different game from snipe/patient: these tokens have survived their
+# launch dump and now trade on AMM math.
+
+name: "bot-migrated-v1"
+strategy_id: "migrated_v1"
+paper_trade: false
+
+env_file: ".env"
+rpc_endpoint: "${SOLANA_NODE_RPC_ENDPOINT}"
+wss_endpoint: "${SOLANA_NODE_WSS_ENDPOINT}"
+private_key: "${SOLANA_PRIVATE_KEY}"
+
+enabled: true   # migrated_v1 active
+separate_process: false
+
+platform: "pump_fun"
+
+trade:
+  # ~$0.50 per trade — slightly bigger than snipe/patient because slippage
+  # is negligible on a $7K+ pool, gas is small fraction of position.
+  buy_amount: 0.006
+  buy_slippage: 0.10   # Jupiter handles routing; 10% is conservative for newly-migrated tokens
+  sell_slippage: 0.10
+
+  exit_strategy: "tp_sl"
+  take_profit_percentage: 0.25    # +25% TP (realistic for momentum on graduates)
+  stop_loss_percentage: 0.15      # -15% SL
+  max_hold_time: 600              # hold up to 10 min (much longer than snipe)
+  price_check_interval: 5
+
+  extreme_fast_mode: false
+  extreme_fast_token_amount: 0
+
+priority_fees:
+  enable_dynamic: false
+  enable_fixed: true
+  fixed_amount: 500_000
+  extra_percentage: 0.0
+  hard_cap: 500_000
+
+# Compute unit budgets — Jupiter handles its own dynamic CU limits internally
+# (dynamicComputeUnitLimit=true), but these fall back if needed.
+compute_units:
+  buy: 200_000
+  sell: 200_000
+
+filters:
+  match_string: null
+  bro_address: null
+  listener_type: "migration"   # ← the NEW listener
+  max_token_age: 3600          # generous — migration listener handles staleness
+  marry_mode: false
+  yolo_mode: true
+
+retries:
+  max_attempts: 1
+  wait_after_creation: 5   # post-migration: pool is already established, just settle a moment
+  wait_after_buy: 10
+  wait_before_new_token: 5
+
+cleanup:
+  mode: "on_fail"
+  force_close_with_burn: false
+  with_priority_fee: false
+
+node:
+  max_rps: 25
