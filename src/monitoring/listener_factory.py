@@ -125,6 +125,23 @@ class ListenerFactory:
             )
             return listener
 
+        elif listener_type == "migration":
+            # Migration listener detects pump.fun bonding curves that just
+            # graduated to PumpSwap. These tokens have $80K+ locked liquidity
+            # by definition and trade on AMM, not bonding curve.
+            if wss_endpoint is None:
+                raise ValueError("wss_endpoint is required for 'migration' listener")
+            from monitoring.universal_migration_listener import (
+                UniversalMigrationListener,
+            )
+
+            listener = UniversalMigrationListener(
+                wss_endpoint=wss_endpoint,
+                platforms=platforms,
+            )
+            logger.info("Created Universal Migration listener")
+            return listener
+
         elif listener_type == "patient":
             # Patient listener wraps the logs listener but defers callbacks
             # until tokens have aged into [min_age, max_age] window. Used by
@@ -163,7 +180,7 @@ class ListenerFactory:
         Returns:
             List of supported listener type strings
         """
-        return ["logs", "blocks", "geyser", "pumpportal", "patient"]
+        return ["logs", "blocks", "geyser", "pumpportal", "patient", "migration"]
 
     @staticmethod
     def get_platform_compatible_listeners(platform: Platform) -> list[str]:
@@ -176,7 +193,7 @@ class ListenerFactory:
             List of compatible listener types
         """
         if platform == Platform.PUMP_FUN:
-            return ["logs", "blocks", "geyser", "pumpportal", "patient"]
+            return ["logs", "blocks", "geyser", "pumpportal", "patient", "migration"]
         elif platform == Platform.LETS_BONK:
             return ["blocks", "geyser", "pumpportal"]  # Added pumpportal support
         else:
