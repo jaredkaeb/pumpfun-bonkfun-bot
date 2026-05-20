@@ -37,8 +37,11 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-JUPITER_QUOTE_URL = "https://quote-api.jup.ag/v6/quote"
-JUPITER_SWAP_URL = "https://quote-api.jup.ag/v6/swap"
+# Jupiter migrated the public API endpoint in early 2026. The old
+# quote-api.jup.ag no longer resolves. The new public ("lite") endpoint
+# uses different paths under /swap/v1/.
+JUPITER_QUOTE_URL = "https://lite-api.jup.ag/swap/v1/quote"
+JUPITER_SWAP_URL = "https://lite-api.jup.ag/swap/v1/swap"
 SOL_MINT = "So11111111111111111111111111111111111111112"
 QUOTE_TIMEOUT_SECONDS = 5.0
 SWAP_TIMEOUT_SECONDS = 8.0
