@@ -25,6 +25,20 @@ class ListenerFactory:
         patient_min_age_seconds: int = 300,
         patient_max_age_seconds: int = 1800,
         patient_scan_interval_seconds: int = 30,
+        # Dexscreener trending listener config
+        dex_poll_interval_seconds: int = 45,
+        dex_min_age_seconds: int = 3600,
+        dex_max_age_seconds: int = 86400,
+        dex_min_liquidity_usd: float = 30_000.0,
+        dex_min_volume_1h_usd: float = 5_000.0,
+        dex_min_price_change_1h_pct: float = 0.0,
+        dex_min_price_change_6h_pct: float = 0.0,
+        dex_max_price_change_24h_pct: float = 2000.0,
+        # PumpSwap new-pool listener config
+        rpc_endpoint: str | None = None,
+        newpool_min_post_creation_seconds: int = 30,
+        newpool_max_post_creation_seconds: int = 600,
+        newpool_min_quote_reserve_sol: float = 30.0,
     ) -> BaseTokenListener:
         """Create a token listener based on the specified type.
 
@@ -167,10 +181,75 @@ class ListenerFactory:
             )
             return listener
 
+        elif listener_type == "dexscreener_trending":
+            # Polls Dexscreener for Solana tokens with real momentum signals
+            # (age, liquidity, rising volume, buy/sell ratio, price action).
+            # No WSS endpoint needed — it's pure HTTP polling.
+            from monitoring.dexscreener_trending_listener import (
+                DexscreenerTrendingListener,
+                TrendingFilters,
+            )
+
+            filters = TrendingFilters(
+                min_age_seconds=dex_min_age_seconds,
+                max_age_seconds=dex_max_age_seconds,
+                min_liquidity_usd=dex_min_liquidity_usd,
+                min_volume_1h_usd=dex_min_volume_1h_usd,
+                min_price_change_1h_pct=dex_min_price_change_1h_pct,
+                min_price_change_6h_pct=dex_min_price_change_6h_pct,
+                max_price_change_24h_pct=dex_max_price_change_24h_pct,
+            )
+            listener = DexscreenerTrendingListener(
+                platforms=platforms,
+                poll_interval_seconds=dex_poll_interval_seconds,
+                filters=filters,
+            )
+            logger.info(
+                "Created Dexscreener trending listener "
+                "(poll=%ds, age=%d-%ds, min_liq=$%.0f)",
+                dex_poll_interval_seconds,
+                dex_min_age_seconds,
+                dex_max_age_seconds,
+                dex_min_liquidity_usd,
+            )
+            return listener
+
+        elif listener_type == "pumpswap_new_pool":
+            # Catches PumpSwap pool creations in real time = pump.fun graduates
+            # at hour 0, before Dexscreener trending picks them up. This is the
+            # leading indicator the strategy needs.
+            if wss_endpoint is None or rpc_endpoint is None:
+                raise ValueError(
+                    "wss_endpoint AND rpc_endpoint required for 'pumpswap_new_pool'"
+                )
+            from monitoring.pumpswap_new_pool_listener import (
+                PumpSwapNewPoolListener,
+                NewPoolFilters,
+            )
+
+            filters = NewPoolFilters(
+                min_post_creation_seconds=newpool_min_post_creation_seconds,
+                max_post_creation_seconds=newpool_max_post_creation_seconds,
+                min_quote_reserve_sol=newpool_min_quote_reserve_sol,
+            )
+            listener = PumpSwapNewPoolListener(
+                wss_endpoint=wss_endpoint,
+                rpc_endpoint=rpc_endpoint,
+                platforms=platforms,
+                filters=filters,
+            )
+            logger.info(
+                "Created PumpSwap new-pool listener (wait=%ds, min_quote=%.1f SOL)",
+                newpool_min_post_creation_seconds, newpool_min_quote_reserve_sol,
+            )
+            return listener
+
         else:
             raise ValueError(
                 f"Invalid listener type '{listener_type}'. "
-                f"Must be one of: 'logs', 'blocks', 'geyser', 'pumpportal', 'patient'"
+                f"Must be one of: 'logs', 'blocks', 'geyser', 'pumpportal', "
+                f"'patient', 'migration', 'dexscreener_trending', "
+                f"'pumpswap_new_pool'"
             )
 
     @staticmethod
@@ -180,7 +259,16 @@ class ListenerFactory:
         Returns:
             List of supported listener type strings
         """
-        return ["logs", "blocks", "geyser", "pumpportal", "patient", "migration"]
+        return [
+            "logs",
+            "blocks",
+            "geyser",
+            "pumpportal",
+            "patient",
+            "migration",
+            "dexscreener_trending",
+            "pumpswap_new_pool",
+        ]
 
     @staticmethod
     def get_platform_compatible_listeners(platform: Platform) -> list[str]:
@@ -193,7 +281,16 @@ class ListenerFactory:
             List of compatible listener types
         """
         if platform == Platform.PUMP_FUN:
-            return ["logs", "blocks", "geyser", "pumpportal", "patient", "migration"]
+            return [
+            "logs",
+            "blocks",
+            "geyser",
+            "pumpportal",
+            "patient",
+            "migration",
+            "dexscreener_trending",
+            "pumpswap_new_pool",
+        ]
         elif platform == Platform.LETS_BONK:
             return ["blocks", "geyser", "pumpportal"]  # Added pumpportal support
         else:

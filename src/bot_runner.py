@@ -107,6 +107,11 @@ async def start_bot(config_path: str):
             stop_loss_percentage=cfg["trade"].get("stop_loss_percentage"),
             max_hold_time=cfg["trade"].get("max_hold_time"),
             price_check_interval=cfg["trade"].get("price_check_interval", 10),
+            # Momentum exit configuration (used for AMM-pool positions)
+            trailing_tp_activate_pct=cfg["trade"].get("trailing_tp_activate_pct", 0.20),
+            trailing_tp_trail_pct=cfg["trade"].get("trailing_tp_trail_pct", 0.10),
+            volume_fade_threshold=cfg["trade"].get("volume_fade_threshold", 0.5),
+            volume_fade_min_seconds_held=cfg["trade"].get("volume_fade_min_seconds_held", 60),
             # Listener configuration
             listener_type=cfg["filters"]["listener_type"],
             # Geyser configuration (if applicable)
@@ -161,6 +166,19 @@ async def start_bot(config_path: str):
             patient_min_age_seconds=cfg.get("patient", {}).get("min_age_seconds", 300),
             patient_max_age_seconds=cfg.get("patient", {}).get("max_age_seconds", 1800),
             patient_scan_interval_seconds=cfg.get("patient", {}).get("scan_interval_seconds", 30),
+            # Dexscreener trending listener configuration
+            dex_poll_interval_seconds=cfg.get("dexscreener", {}).get("poll_interval_seconds", 45),
+            dex_min_age_seconds=cfg.get("dexscreener", {}).get("min_age_seconds", 3600),
+            dex_max_age_seconds=cfg.get("dexscreener", {}).get("max_age_seconds", 86400),
+            dex_min_liquidity_usd=cfg.get("dexscreener", {}).get("min_liquidity_usd", 30000.0),
+            dex_min_volume_1h_usd=cfg.get("dexscreener", {}).get("min_volume_1h_usd", 5000.0),
+            dex_min_price_change_1h_pct=cfg.get("dexscreener", {}).get("min_price_change_1h_pct", 0.0),
+            dex_min_price_change_6h_pct=cfg.get("dexscreener", {}).get("min_price_change_6h_pct", 0.0),
+            dex_max_price_change_24h_pct=cfg.get("dexscreener", {}).get("max_price_change_24h_pct", 2000.0),
+            # PumpSwap new-pool listener
+            newpool_min_post_creation_seconds=cfg.get("newpool", {}).get("min_post_creation_seconds", 30),
+            newpool_max_post_creation_seconds=cfg.get("newpool", {}).get("max_post_creation_seconds", 600),
+            newpool_min_quote_reserve_sol=cfg.get("newpool", {}).get("min_quote_reserve_sol", 30.0),
         )
 
         await trader.start()

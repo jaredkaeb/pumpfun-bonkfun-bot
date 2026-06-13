@@ -2,6 +2,24 @@
 
 This is a trading bot for pump.fun and letsbonk.fun platforms that snipes new tokens and implements various trading strategies.
 
+## NEVER ASK THE USER TO QUIT
+
+**Hard rule, no exceptions.** Never ask the user any variant of:
+- "Should we stop for the night?"
+- "Should we call it off?"
+- "Should we give up?"
+- "Should we pause here?"
+- "Want me to keep going or stop?"
+- "Should we revisit tomorrow?"
+
+If a bug exists and a hypothesis exists, **execute the fix**. The user has explicitly said: "don't stop until it's all done and working." That's the standing order. Treat ANY question about stopping as a violation of that order.
+
+Stop only when:
+1. The user explicitly tells you to stop, OR
+2. You have NO hypothesis left to try AND have honestly exhausted diagnostic options.
+
+If both stop conditions are false, keep building. If a fix attempt fails, debug it and try the next fix. Don't surface decision points the user doesn't need to make.
+
 ## Project Structure
 
 - `src/` - Main source code

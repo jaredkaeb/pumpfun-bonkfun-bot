@@ -300,30 +300,90 @@ class SolanaClient:
         """
         await self._rate_limiter.acquire()
         client = await self.get_client()
+        from solders.signature import Signature
+        sig_obj = (
+            signature if isinstance(signature, Signature)
+            else Signature.from_string(signature)
+        )
+        primary_confirm_failed = False
         try:
             await client.confirm_transaction(
-                signature, commitment=commitment, sleep_seconds=1
+                sig_obj, commitment=commitment, sleep_seconds=1
             )
         except Exception:
-            logger.exception(f"Failed to confirm transaction {signature}")
+            # solana-py's confirm_transaction raises UnconfirmedTxError when
+            # the blockhash expires before the tx lands at the requested
+            # commitment. But under heavy congestion the tx OFTEN lands a few
+            # seconds AFTER that — by the time we ask, status is fine. So we
+            # don't bail here; we re-check the actual on-chain status below.
+            primary_confirm_failed = True
+            logger.warning(
+                "Primary confirm timed out for %s — re-checking status directly",
+                str(signature)[:16],
+            )
+
+        # Re-verify by directly polling getSignatureStatuses. This is fast
+        # (~1 RPC) and is the source of truth — a 'finalized'/'confirmed'
+        # status with err=None is a successful trade regardless of whether the
+        # primary confirm path timed out.
+        #
+        # Window: 30 attempts × 2s = 60s of polling, matching Solana's
+        # blockhash validity window. Under congestion, sells often land late
+        # (40-50s after submit) — bailing at 10s would leak winners.
+        max_retries = 30 if primary_confirm_failed else 1
+        for attempt in range(max_retries):
+            try:
+                resp = await client.get_signature_statuses(
+                    [sig_obj], search_transaction_history=True
+                )
+                st = resp.value[0] if resp.value else None
+            except Exception:  # noqa: BLE001
+                st = None
+            if st is not None:
+                if st.err is not None:
+                    logger.error(
+                        "Transaction %s landed with error: %s",
+                        str(signature)[:16], st.err,
+                    )
+                    return False
+                # No err and we have a status entry — that's success
+                if str(st.confirmation_status) in (
+                    "TransactionConfirmationStatus.Confirmed",
+                    "TransactionConfirmationStatus.Finalized",
+                    "Confirmed",
+                    "Finalized",
+                ):
+                    if primary_confirm_failed:
+                        logger.info(
+                            "Transaction %s landed on retry-check #%d (%s)",
+                            str(signature)[:16], attempt + 1, st.confirmation_status,
+                        )
+                    return True
+            if not primary_confirm_failed:
+                break
+            await asyncio.sleep(2)
+        if primary_confirm_failed:
+            logger.warning(
+                "Transaction %s did not land within 60s — declaring dropped",
+                str(signature)[:16],
+            )
             return False
 
-        # Verify the transaction actually succeeded (no program errors)
+        # Final fallback: fetch full tx to ensure meta.err is unset
         result = await self._get_transaction_result(str(signature))
         if not result:
             logger.warning(
-                f"Could not fetch transaction {str(signature)[:16]}... "
-                f"to verify execution — treating as unconfirmed"
+                "Could not fetch tx %s to verify execution — treating as unconfirmed",
+                str(signature)[:16],
             )
             return False
-
         tx_err = result.get("meta", {}).get("err")
         if tx_err:
             logger.error(
-                f"Transaction {str(signature)[:16]}... confirmed but failed: {tx_err}"
+                "Transaction %s confirmed but failed: %s",
+                str(signature)[:16], tx_err,
             )
             return False
-
         return True
 
     async def get_transaction_token_balance(

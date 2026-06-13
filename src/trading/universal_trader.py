@@ -6,6 +6,8 @@ Cleaned up to remove all platform-specific hardcoding.
 import asyncio
 import json
 import sys
+
+import aiohttp
 from datetime import datetime
 from pathlib import Path
 from time import monotonic
@@ -80,6 +82,14 @@ class UniversalTrader:
         stop_loss_percentage: float | None = None,
         max_hold_time: int | None = None,
         price_check_interval: int = 10,
+        # Momentum exit configuration (only used for AMM-pool positions)
+        # — when price hits +trailing_tp_activate_pct, switch to trailing-stop mode:
+        #   lock the peak, exit if price drops trailing_tp_trail_pct from peak.
+        # — volume_fade_threshold: if 5-min volume drops to X% of peak 5-min vol, exit.
+        trailing_tp_activate_pct: float = 0.20,
+        trailing_tp_trail_pct: float = 0.10,
+        volume_fade_threshold: float = 0.5,
+        volume_fade_min_seconds_held: int = 60,
         # Priority fee configuration
         enable_dynamic_priority_fee: bool = False,
         enable_fixed_priority_fee: bool = True,
@@ -110,6 +120,21 @@ class UniversalTrader:
         patient_min_age_seconds: int = 300,
         patient_max_age_seconds: int = 1800,
         patient_scan_interval_seconds: int = 30,
+        # Dexscreener trending listener config — only used when
+        # listener_type == "dexscreener_trending"
+        dex_poll_interval_seconds: int = 45,
+        dex_min_age_seconds: int = 3600,
+        dex_max_age_seconds: int = 86400,
+        dex_min_liquidity_usd: float = 30_000.0,
+        dex_min_volume_1h_usd: float = 5_000.0,
+        dex_min_price_change_1h_pct: float = 0.0,
+        dex_min_price_change_6h_pct: float = 0.0,
+        dex_max_price_change_24h_pct: float = 2000.0,
+        # PumpSwap new-pool listener config — only used when
+        # listener_type == "pumpswap_new_pool"
+        newpool_min_post_creation_seconds: int = 30,
+        newpool_max_post_creation_seconds: int = 600,
+        newpool_min_quote_reserve_sol: float = 30.0,
     ):
         """Initialize the universal trader."""
         # Core components
@@ -172,14 +197,26 @@ class UniversalTrader:
             compute_units=self.compute_units,
         )
 
-        # Jupiter trader handles migrated tokens (post-PumpSwap). Routed via
-        # additional_data["migration"] flag set by UniversalMigrationListener.
+        # Migrated/AMM-pool trading. Two traders side-by-side:
+        #   PumpSwapTrader — direct calls to pump-amm program (preferred for
+        #     PumpSwap pools; bypasses Jupiter's broken adapter for fresh
+        #     graduations).
+        #   JupiterTrader  — fallback for Raydium/other non-PumpSwap pools.
+        # Routing is done in _execute_buy/sell based on additional_data.dex_id.
         from integrations.jupiter_trader import JupiterTrader
+        from integrations.pumpswap_trader import PumpSwapTrader
         self.jupiter_trader = JupiterTrader(
             client=self.solana_client,
             wallet=self.wallet,
             slippage_bps=int(buy_slippage * 10000),  # 0.30 → 3000 bps
             prioritization_fee_lamports=fixed_priority_fee,
+        )
+        self.pumpswap_trader = PumpSwapTrader(
+            client=self.solana_client,
+            wallet=self.wallet,
+            slippage_bps=int(buy_slippage * 10000),
+            prioritization_fee_lamports=fixed_priority_fee,
+            compute_unit_limit=(compute_units or {}).get("buy", 250_000),
         )
 
         # Initialize the appropriate listener with platform filtering
@@ -195,6 +232,20 @@ class UniversalTrader:
             patient_min_age_seconds=patient_min_age_seconds,
             patient_max_age_seconds=patient_max_age_seconds,
             patient_scan_interval_seconds=patient_scan_interval_seconds,
+            # Dexscreener config — only relevant when listener_type=="dexscreener_trending"
+            dex_poll_interval_seconds=dex_poll_interval_seconds,
+            dex_min_age_seconds=dex_min_age_seconds,
+            dex_max_age_seconds=dex_max_age_seconds,
+            dex_min_liquidity_usd=dex_min_liquidity_usd,
+            dex_min_volume_1h_usd=dex_min_volume_1h_usd,
+            dex_min_price_change_1h_pct=dex_min_price_change_1h_pct,
+            dex_min_price_change_6h_pct=dex_min_price_change_6h_pct,
+            dex_max_price_change_24h_pct=dex_max_price_change_24h_pct,
+            # PumpSwap new-pool config — only relevant when listener_type=="pumpswap_new_pool"
+            rpc_endpoint=rpc_endpoint,
+            newpool_min_post_creation_seconds=newpool_min_post_creation_seconds,
+            newpool_max_post_creation_seconds=newpool_max_post_creation_seconds,
+            newpool_min_quote_reserve_sol=newpool_min_quote_reserve_sol,
         )
 
         # Trading parameters
@@ -211,6 +262,13 @@ class UniversalTrader:
         self.stop_loss_percentage = stop_loss_percentage
         self.max_hold_time = max_hold_time
         self.price_check_interval = price_check_interval
+        # Momentum exit knobs
+        self.trailing_tp_activate_pct = trailing_tp_activate_pct
+        self.trailing_tp_trail_pct = trailing_tp_trail_pct
+        self.volume_fade_threshold = volume_fade_threshold
+        self.volume_fade_min_seconds_held = volume_fade_min_seconds_held
+        # HTTP session for Dexscreener price/volume polls during monitoring
+        self._momentum_http = None  # type: ignore[assignment]
 
         # Timing parameters
         self.wait_time_after_creation = wait_time_after_creation
@@ -879,25 +937,235 @@ class UniversalTrader:
                 trade_id,
             )
 
+    async def _fetch_amm_state(self, token_info: TokenInfo) -> dict | None:
+        """Pull current price + 5-min volume for an AMM-pool token.
+
+        Strategy: try Dexscreener first (fast, with volume data). Fall back to
+        reading the PumpSwap pool directly on chain for fresh pools that
+        haven't been indexed by Dexscreener yet (which is exactly when our
+        new-pool listener catches them — the leading-indicator window).
+        """
+        try:
+            if self._momentum_http is None or self._momentum_http.closed:
+                self._momentum_http = aiohttp.ClientSession()
+            url = f"https://api.dexscreener.com/latest/dex/tokens/{token_info.mint}"
+            async with self._momentum_http.get(
+                url, timeout=aiohttp.ClientTimeout(total=4)
+            ) as resp:
+                if resp.status != 200:
+                    return await self._fetch_amm_state_onchain(token_info)
+                data = await resp.json()
+        except Exception:  # noqa: BLE001
+            logger.debug("AMM state fetch from Dexscreener failed", exc_info=True)
+            return await self._fetch_amm_state_onchain(token_info)
+        pairs = data.get("pairs") or []
+        # Pick the SOL-quoted pair with the most liquidity
+        sol_pairs = [
+            p for p in pairs
+            if p.get("chainId") == "solana"
+            and p.get("quoteToken", {}).get("address")
+            == "So11111111111111111111111111111111111111112"
+        ]
+        if not sol_pairs:
+            return None
+        canon = max(sol_pairs, key=lambda p: (p.get("liquidity") or {}).get("usd") or 0)
+        price_native = canon.get("priceNative")  # string SOL price per token
+        if price_native is None:
+            return None
+        try:
+            price_sol = float(price_native)
+        except (TypeError, ValueError):
+            return None
+        return {
+            "price_sol": price_sol,
+            "price_usd": float(canon.get("priceUsd") or 0),
+            "volume_m5": float((canon.get("volume") or {}).get("m5") or 0),
+            "volume_h1": float((canon.get("volume") or {}).get("h1") or 0),
+            "liquidity_usd": float((canon.get("liquidity") or {}).get("usd") or 0),
+        }
+
+    async def _fetch_amm_state_onchain(self, token_info: TokenInfo) -> dict | None:
+        """Read PumpSwap pool state directly on chain. Used as fallback when
+        Dexscreener doesn't have the token indexed yet (fresh new pools).
+
+        Returns price in SOL/whole_token, computed from constant-product math
+        using current reserves. Volume metrics are 0 (unknown on chain).
+        """
+        ad = token_info.additional_data or {}
+        pool_addr_str = ad.get("pumpswap_pool") or ad.get("pair_address")
+        if not pool_addr_str:
+            return None
+        try:
+            from solders.pubkey import Pubkey as _Pk
+            from integrations.pumpswap_trader import fetch_pool_state, WSOL_MINT
+            pool = await fetch_pool_state(
+                self.solana_client,
+                _Pk.from_string(pool_addr_str),
+                token_info.mint,
+                WSOL_MINT,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("on-chain amm state fetch failed", exc_info=True)
+            return None
+        if pool is None or pool.base_reserve == 0:
+            return None
+        # SOL per whole token: (quote_lamports / 1e9) / (base_raw / 1e6)
+        # = quote_lamports / base_raw * 1e6 / 1e9
+        # = quote_lamports * 1e-3 / base_raw
+        price_sol = (pool.quote_reserve / 1e9) / (pool.base_reserve / 1e6)
+        return {
+            "price_sol": price_sol,
+            "price_usd": price_sol * 150,  # rough — for logging only
+            "volume_m5": 0.0,
+            "volume_h1": 0.0,
+            "liquidity_usd": (pool.quote_reserve / 1e9) * 2 * 150,
+        }
+
+    def _compute_amm_exit(
+        self,
+        position: Position,
+        current_price: float,
+        peak_price: float | None,
+        trailing_armed: bool,
+        peak_volume_m5: float,
+        current_volume_m5: float,
+        held_seconds: float,
+    ) -> tuple[bool, Any, float, bool]:
+        """Trailing TP + volume-fade exit logic for AMM positions.
+
+        Returns: (should_exit, exit_reason_or_None, new_peak_price, new_trailing_armed)
+
+        Logic priority:
+          1. Hard SL (price drops below SL threshold) → exit, reason=STOP_LOSS
+          2. Trailing-armed + price drops trail_pct from peak → exit, reason=TAKE_PROFIT
+          3. Volume fade: held > min_seconds and 5m vol < threshold * peak → exit, reason=VOLUME_FADE
+          4. Max hold time exceeded → exit, reason=MAX_HOLD_TIME
+          5. Hard TP (rarely hit if trailing arms first) → exit, reason=TAKE_PROFIT
+          6. Otherwise: update peak, possibly arm trailing
+        """
+        from trading.position import ExitReason
+
+        new_peak = peak_price
+        if new_peak is None or current_price > new_peak:
+            new_peak = current_price
+
+        entry = position.entry_price
+        if entry <= 0:
+            return False, None, new_peak, trailing_armed
+
+        gain = (current_price - entry) / entry  # +0.30 = +30%
+        peak_gain = (new_peak - entry) / entry
+
+        # Arm trailing when peak gain >= activate threshold
+        new_armed = trailing_armed or peak_gain >= self.trailing_tp_activate_pct
+
+        # 1. Hard SL
+        if self.stop_loss_percentage is not None:
+            if gain <= -abs(self.stop_loss_percentage):
+                return True, ExitReason.STOP_LOSS, new_peak, new_armed
+
+        # 2. Trailing exit
+        if new_armed and new_peak > 0:
+            drop_from_peak = (new_peak - current_price) / new_peak
+            if drop_from_peak >= self.trailing_tp_trail_pct:
+                logger.info(
+                    "Trailing exit: peak=%.10f current=%.10f drop=%.1f%%",
+                    new_peak, current_price, drop_from_peak * 100,
+                )
+                return True, ExitReason.TAKE_PROFIT, new_peak, new_armed
+
+        # 3. Volume fade
+        if (
+            held_seconds >= self.volume_fade_min_seconds_held
+            and peak_volume_m5 > 0
+            and current_volume_m5 < self.volume_fade_threshold * peak_volume_m5
+        ):
+            logger.info(
+                "Volume fade exit: peak_vol_m5=%.0f current_vol_m5=%.0f (%.0f%% of peak)",
+                peak_volume_m5, current_volume_m5,
+                (current_volume_m5 / peak_volume_m5) * 100,
+            )
+            # Treat as TAKE_PROFIT if we're up, STOP_LOSS if we're down
+            reason = ExitReason.TAKE_PROFIT if gain >= 0 else ExitReason.STOP_LOSS
+            return True, reason, new_peak, new_armed
+
+        # 4. Max hold time
+        if self.max_hold_time and held_seconds >= self.max_hold_time:
+            return True, ExitReason.MAX_HOLD_TIME, new_peak, new_armed
+
+        # 5. Hard TP (fallback, before trailing arms)
+        if (
+            not new_armed
+            and self.take_profit_percentage is not None
+            and gain >= self.take_profit_percentage
+        ):
+            return True, ExitReason.TAKE_PROFIT, new_peak, new_armed
+
+        return False, None, new_peak, new_armed
+
     async def _monitor_position_until_exit(
         self, token_info: TokenInfo, position: Position
     ) -> None:
-        """Monitor a position until exit conditions are met."""
+        """Monitor a position until exit conditions are met.
+
+        Two price-source modes:
+          - Bonding curve (default): pull price from on-chain curve via
+            platform's curve_manager.
+          - AMM pool (migrated / Dexscreener-sourced): pull price from
+            Dexscreener API and run trailing-TP + volume-fade exit logic
+            on top of the standard TP/SL.
+        """
+        amm_mode = self._is_amm_pool(token_info)
         logger.info(
-            f"Starting position monitoring (check interval: {self.price_check_interval}s)"
+            "Starting position monitoring (mode=%s, interval=%ds, "
+            "trailing_activate=%.0f%%, trailing_drop=%.0f%%, vol_fade=%.0f%%)",
+            "AMM" if amm_mode else "bonding_curve",
+            self.price_check_interval,
+            self.trailing_tp_activate_pct * 100,
+            self.trailing_tp_trail_pct * 100,
+            self.volume_fade_threshold * 100,
         )
 
-        # Get pool address for price monitoring using platform-agnostic method
-        pool_address = self._get_pool_address(token_info)
-        curve_manager = self.platform_implementations.curve_manager
+        # AMM-mode bookkeeping: track peak price seen + peak 5-min volume seen
+        peak_price: float | None = None
+        trailing_armed = False
+        peak_volume_m5: float = 0.0
+        # bonding-curve setup
+        pool_address = self._get_pool_address(token_info) if not amm_mode else None
+        curve_manager = self.platform_implementations.curve_manager if not amm_mode else None
+        position_opened_at = monotonic()
 
         while position.is_active:
             try:
-                # Get current price from pool/curve
-                current_price = await curve_manager.calculate_price(pool_address)
+                # Get current price from the right source
+                if amm_mode:
+                    amm_state = await self._fetch_amm_state(token_info)
+                    if amm_state is None:
+                        await asyncio.sleep(self.price_check_interval)
+                        continue
+                    current_price = amm_state["price_sol"]
+                    cur_vol_m5 = amm_state["volume_m5"]
+                    if cur_vol_m5 > peak_volume_m5:
+                        peak_volume_m5 = cur_vol_m5
+                else:
+                    current_price = await curve_manager.calculate_price(pool_address)
 
-                # Check if position should be exited
-                should_exit, exit_reason = position.should_exit(current_price)
+                # Compute exit decision
+                if amm_mode:
+                    held_seconds = monotonic() - position_opened_at
+                    should_exit, exit_reason, peak_price, trailing_armed = (
+                        self._compute_amm_exit(
+                            position=position,
+                            current_price=current_price,
+                            peak_price=peak_price,
+                            trailing_armed=trailing_armed,
+                            peak_volume_m5=peak_volume_m5,
+                            current_volume_m5=cur_vol_m5,
+                            held_seconds=held_seconds,
+                        )
+                    )
+                else:
+                    should_exit, exit_reason = position.should_exit(current_price)
 
                 if should_exit and exit_reason:
                     logger.info(f"Exit condition met: {exit_reason.value}")
@@ -1013,19 +1281,102 @@ class UniversalTrader:
     # ---- AI Strategy Manager: route buys/sells based on token type ------------
 
     @staticmethod
-    def _is_migrated(token_info: TokenInfo) -> bool:
-        """Check if this token came from the migration listener."""
-        return bool((token_info.additional_data or {}).get("migration"))
+    def _is_amm_pool(token_info: TokenInfo) -> bool:
+        """Check if this token trades on an AMM pool (vs the bonding curve).
+
+        Includes:
+        - Tokens from the migration listener (graduated to PumpSwap)
+        - Tokens from the dexscreener listener (already trading on AMM)
+        - Tokens from the pumpswap_new_pool listener (just-graduated AMM pools)
+        """
+        ad = token_info.additional_data or {}
+        return bool(
+            ad.get("migration")
+            or ad.get("source") in {"dexscreener_trending", "pumpswap_new_pool"}
+        )
+
+    @staticmethod
+    def _is_pumpswap_pool(token_info: TokenInfo) -> bool:
+        """Decide if we should route via direct PumpSwap (preferred) or Jupiter."""
+        ad = token_info.additional_data or {}
+        # Migration listener tokens are PumpSwap by definition
+        if ad.get("migration"):
+            return True
+        # Dexscreener tells us the dex
+        if ad.get("dex_id") in {"pumpswap", "pumpfun"}:
+            return True
+        return False
 
     async def _execute_buy(self, token_info: TokenInfo) -> TradeResult:
-        """Route buy to Jupiter for migrated tokens, bonding curve buyer otherwise."""
-        if self._is_migrated(token_info):
+        """Route buy based on the venue. PumpSwap → direct trader; Raydium/other → Jupiter; bonding curve → platform buyer."""
+        if self.is_paper_trade:
+            return await self._paper_buy(token_info)
+        if self._is_amm_pool(token_info):
             sol_lamports = int(self.buy_amount * 1_000_000_000)
+            if self._is_pumpswap_pool(token_info):
+                logger.info(
+                    "Routing buy via direct PumpSwap (%.6f SOL)", self.buy_amount
+                )
+                return await self.pumpswap_trader.buy(token_info, sol_lamports)
             logger.info(
-                "Routing buy via Jupiter (migrated token, %.6f SOL)", self.buy_amount
+                "Routing buy via Jupiter (non-PumpSwap AMM, %.6f SOL)", self.buy_amount
             )
             return await self.jupiter_trader.buy(token_info, sol_lamports)
         return await self.buyer.execute(token_info)
+
+    async def _paper_buy(self, token_info: TokenInfo) -> TradeResult:
+        """Simulate a buy without spending SOL — uses current Dexscreener price.
+
+        Applies a synthetic 0.5% slippage to mimic real fills. Resulting
+        Position record drives the same exit logic but the sell will also
+        be intercepted by _paper_sell.
+        """
+        amm_state = await self._fetch_amm_state(token_info)
+        if amm_state is None or amm_state["price_sol"] <= 0:
+            return TradeResult(
+                success=False, platform=Platform.PUMP_FUN,
+                error_message="paper: no live price from Dexscreener",
+            )
+        # Buy slippage: receive 0.5% fewer tokens than market mid
+        market_price = amm_state["price_sol"]
+        effective_price = market_price * 1.005
+        whole_tokens = self.buy_amount / effective_price
+        logger.info(
+            "[PAPER] BUY %s: %.4f tokens @ %.10f SOL/token (mid=%.10f, sim_slip=0.5%%)",
+            token_info.symbol, whole_tokens, effective_price, market_price,
+        )
+        return TradeResult(
+            success=True,
+            platform=Platform.PUMP_FUN,
+            tx_signature=f"paper_buy_{int(monotonic())}_{token_info.symbol}",
+            price=effective_price,
+            amount=whole_tokens,
+        )
+
+    async def _paper_sell(
+        self, token_info: TokenInfo, token_amount: float
+    ) -> TradeResult:
+        amm_state = await self._fetch_amm_state(token_info)
+        if amm_state is None or amm_state["price_sol"] <= 0:
+            return TradeResult(
+                success=False, platform=Platform.PUMP_FUN,
+                error_message="paper: no live price from Dexscreener",
+            )
+        market_price = amm_state["price_sol"]
+        # Sell slippage: receive 0.5% less SOL than market mid
+        effective_price = market_price * 0.995
+        sol_out = token_amount * effective_price
+        logger.info(
+            "[PAPER] SELL %s: %.4f tokens @ %.10f SOL/token = %.6f SOL",
+            token_info.symbol, token_amount, effective_price, sol_out,
+        )
+        return TradeResult(
+            success=True,
+            platform=Platform.PUMP_FUN,
+            tx_signature=f"paper_sell_{int(monotonic())}_{token_info.symbol}",
+            price=effective_price,
+            amount=sol_out,
+        )
 
     async def _execute_sell(
         self,
@@ -1033,15 +1384,18 @@ class UniversalTrader:
         token_amount: float,
         token_price: float,
     ) -> TradeResult:
-        """Route sell to Jupiter for migrated tokens, bonding curve seller otherwise.
-
-        token_amount is in DECIMAL token units (e.g. 1234.567). For Jupiter we
-        convert to raw smallest-unit integer using pump.fun's 6-decimal standard.
-        """
-        if self._is_migrated(token_info):
+        """Route sell using the same venue logic as buy."""
+        if self.is_paper_trade:
+            return await self._paper_sell(token_info, token_amount)
+        if self._is_amm_pool(token_info):
             raw_amount = int(token_amount * (10**6))  # pump.fun TOKEN_DECIMALS
+            if self._is_pumpswap_pool(token_info):
+                logger.info(
+                    "Routing sell via direct PumpSwap (%.4f tokens)", token_amount
+                )
+                return await self.pumpswap_trader.sell(token_info, raw_amount)
             logger.info(
-                "Routing sell via Jupiter (migrated token, %.4f tokens)", token_amount
+                "Routing sell via Jupiter (non-PumpSwap AMM, %.4f tokens)", token_amount
             )
             return await self.jupiter_trader.sell(token_info, raw_amount)
         return await self.seller.execute(

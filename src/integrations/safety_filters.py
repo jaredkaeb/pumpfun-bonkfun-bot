@@ -65,6 +65,21 @@ class FilterContext:
     filters_config: dict[str, Any]  # the Strategy Manager's filter dict
 
 
+def _is_amm_token(ctx: FilterContext) -> bool:
+    """True if this token came from an AMM source (Dexscreener trending or migration listener).
+
+    AMM tokens have no bonding curve — every curve-state-dependent filter
+    should short-circuit pass for them, because the AMM listener already
+    enforced its own liquidity/volume/age signals from Dexscreener.
+    """
+    ad = getattr(ctx.token_info, "additional_data", None) or {}
+    return bool(
+        ad.get("migration")
+        or ad.get("source") == "dexscreener_trending"
+        or ad.get("dex_id") in {"pumpswap", "raydium"}
+    )
+
+
 # --------------------------------------------------------------------------------------
 # Filter 0: token age window (strategy-level age check)
 # --------------------------------------------------------------------------------------
@@ -122,6 +137,9 @@ async def filter_curve_not_complete(ctx: FilterContext) -> FilterResult:
     Post-migration tokens have completely different liquidity dynamics and our
     bonding-curve-based sniping strategy doesn't apply.
     """
+    if _is_amm_token(ctx):
+        # AMM tokens have no curve — the listener routes them deliberately.
+        return FilterResult(passed=True, metrics={"amm_skip": "curve_check"})
     try:
         state = await ctx.curve_manager.get_pool_state(ctx.pool_address)
         if state.get("complete"):
@@ -150,6 +168,19 @@ async def filter_liquidity_floor(ctx: FilterContext) -> FilterResult:
     floor_usd = ctx.filters_config.get("min_liquidity_usd")
     if floor_usd is None:
         return FilterResult(passed=True)  # filter disabled
+
+    if _is_amm_token(ctx):
+        # Dexscreener listener filtered on its own liquidity_usd field;
+        # cross-check here against the additional_data payload.
+        ad = getattr(ctx.token_info, "additional_data", None) or {}
+        liquidity_usd = float(ad.get("liquidity_usd") or 0)
+        if liquidity_usd < floor_usd:
+            return FilterResult(
+                passed=False,
+                skip_reason="liquidity_below_min",
+                metrics={"liquidity_usd": liquidity_usd, "min_required_usd": floor_usd},
+            )
+        return FilterResult(passed=True, metrics={"liquidity_usd": liquidity_usd})
 
     try:
         state = await ctx.curve_manager.get_pool_state(ctx.pool_address)
@@ -186,6 +217,18 @@ async def filter_market_cap_ceiling(ctx: FilterContext) -> FilterResult:
     ceiling_usd = ctx.filters_config.get("max_market_cap_usd")
     if ceiling_usd is None:
         return FilterResult(passed=True)
+
+    if _is_amm_token(ctx):
+        # Dexscreener tells us market_cap directly
+        ad = getattr(ctx.token_info, "additional_data", None) or {}
+        mc = float(ad.get("market_cap") or ad.get("fdv") or 0)
+        if mc > 0 and mc > ceiling_usd:
+            return FilterResult(
+                passed=False,
+                skip_reason="market_cap_above_ceiling",
+                metrics={"market_cap_usd": mc, "max_allowed_usd": ceiling_usd},
+            )
+        return FilterResult(passed=True, metrics={"market_cap_usd": mc})
 
     try:
         state = await ctx.curve_manager.get_pool_state(ctx.pool_address)
@@ -245,6 +288,10 @@ async def filter_not_already_pumped(ctx: FilterContext) -> FilterResult:
     if max_ratio is None:
         return FilterResult(passed=True)
 
+    if _is_amm_token(ctx):
+        # AMM tokens are post-graduation by definition — launch-ratio doesn't apply.
+        return FilterResult(passed=True, metrics={"amm_skip": "launch_ratio"})
+
     try:
         state = await ctx.curve_manager.get_pool_state(ctx.pool_address)
         virt_token = state["virtual_token_reserves"]
@@ -300,6 +347,27 @@ async def filter_substantive_curve_liquidity(ctx: FilterContext) -> FilterResult
     min_real_sol = ctx.filters_config.get("min_real_sol_reserves_sol")
     if min_real_sol is None:
         return FilterResult(passed=True)
+
+    if _is_amm_token(ctx):
+        # No bonding curve. Use Dexscreener liquidity_usd / SOL price as an
+        # equivalent "real liquidity" check.
+        ad = getattr(ctx.token_info, "additional_data", None) or {}
+        liq_usd = float(ad.get("liquidity_usd") or 0)
+        sol_price = await get_sol_price_usd()
+        real_sol = liq_usd / sol_price if sol_price > 0 else 0
+        if real_sol < min_real_sol:
+            return FilterResult(
+                passed=False,
+                skip_reason="real_sol_below_min",
+                metrics={
+                    "real_sol_reserves": real_sol,
+                    "min_required_sol": min_real_sol,
+                },
+            )
+        return FilterResult(
+            passed=True,
+            metrics={"real_sol_reserves": real_sol},
+        )
 
     try:
         state = await ctx.curve_manager.get_pool_state(ctx.pool_address)

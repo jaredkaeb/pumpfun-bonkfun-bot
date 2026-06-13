@@ -1,82 +1,104 @@
-# AI Strategy Manager test bot.
+# Momentum trader — Dexscreener-driven post-graduation momentum strategy.
 #
-# This YAML maps one bot process to one strategy in the Strategy Manager's
-# adaptive_strategy_config.json. The bot reads pause flags, blacklists, and
-# safety-filter thresholds from that config on every token evaluation.
+# Polls Dexscreener for Solana tokens 30min–24h old showing real momentum
+# (rising volume, more buys than sells, healthy liquidity, positive 1h + 6h
+# price action), trades them via the direct PumpSwap path, exits with trailing
+# TP + volume-fade.
 #
-# For the first integration test:
-#   - listener_type: "logs"     (works with just RPC/WSS, no Geyser needed)
-#   - buy_amount: very small    (we'll fund the wallet with a tiny amount)
-#   - paper_trade: false        (real chain, but we control risk via small amount)
-#   - enabled: false            (flip to true when you're ready to run it)
+# Strategy thesis: we can't out-MEV snipers at t=0. We CAN out-discipline
+# degens on filters + exits during the post-graduation momentum window. Same
+# game the user wins manually on Phantom + Dexscreener — automated and 24/7.
 
-# Bot identification and Strategy Manager wiring
 name: "bot-momentum-v1"
-strategy_id: "momentum_v1"  # must match a strategy in adaptive_strategy_config.json
-paper_trade: false
+strategy_id: "momentum_v1"
+paper_trade: true   # CALIBRATION MODE — simulate against live Dexscreener prices,
+                    # no real SOL spent. Flip to false once we see positive
+                    # expectancy across 20+ paper trades.
 
 env_file: ".env"
 rpc_endpoint: "${SOLANA_NODE_RPC_ENDPOINT}"
 wss_endpoint: "${SOLANA_NODE_WSS_ENDPOINT}"
 private_key: "${SOLANA_PRIVATE_KEY}"
 
-enabled: false # snipe paused — pivoting to patient_v1
+enabled: true
 separate_process: false
 
-# Platform
 platform: "pump_fun"
 
-# Trading parameters — kept tiny for first live test.
-# 0.001 SOL ≈ $0.15 at $150/SOL. If anything goes wrong, the max loss per trade
-# is roughly a quarter. Increase only after we verify the loop works.
 trade:
-  buy_amount: 0.003   # ~$0.25 per trade — small enough to control burn, big enough to see real PnL
-  buy_slippage: 0.30
-  sell_slippage: 0.30
+  # Down to 0.003 (~$0.50/trade) while we calibrate. 7 losers showed all
+  # entries were too late in the 1h move. Tighter filters need real-data
+  # validation before we scale back up.
+  buy_amount: 0.003
+  buy_slippage: 0.10
+  sell_slippage: 0.15  # slippage on sells was tight — bumped for liquidity flexibility
 
-  exit_strategy: "tp_sl"     # use take-profit / stop-loss so we exercise the position monitor
-  take_profit_percentage: 0.40
-  stop_loss_percentage: 0.25
-  max_hold_time: 60
-  price_check_interval: 2
+  exit_strategy: "tp_sl"
+  take_profit_percentage: 0.25
+  stop_loss_percentage: 0.10  # tightened from 0.15 — slippage costs ~8pp on fresh pools
+  max_hold_time: 1800
+  price_check_interval: 2     # tightened from 8s — fresh pools dump faster than we polled
 
-  # Disable extreme_fast_mode for the first test so we wait long enough for the
-  # curve to be readable by our safety filters (liquidity, market cap).
+  # Momentum exits (used for AMM-pool positions, which this strategy always trades)
+  trailing_tp_activate_pct: 0.20
+  trailing_tp_trail_pct: 0.10
+  volume_fade_threshold: 0.4
+  volume_fade_min_seconds_held: 90
+
   extreme_fast_mode: false
-  extreme_fast_token_amount: 20
+  extreme_fast_token_amount: 0
 
 priority_fees:
+  # 2M µL/CU was landing buys but SELLS were dropping silently from mempool
+  # (3 trailing/vol-fade exits never confirmed). Bumped to 5M to give sells
+  # more headroom for inclusion. ~$0.20 fee per tx at this level.
   enable_dynamic: false
   enable_fixed: true
-  fixed_amount: 500_000   # raised from 200k: improve tx land-rate for sells
+  fixed_amount: 5_000_000
   extra_percentage: 0.0
-  hard_cap: 500_000
+  hard_cap: 5_000_000
 
-# Compute unit overrides — DAY 2 FIX: yesterday both sells failed with
-# ComputationalBudgetExceeded. The default 60k sell budget was set before
-# pump.fun's 2026-04-28 upgrade added 1-2 accounts to the sell instruction.
-# Bumping sell to 120k and buy to 150k for headroom.
 compute_units:
-  buy: 150_000
-  sell: 120_000
+  buy: 250_000
+  sell: 250_000
 
-# Filter configuration. NOTE: the Strategy Manager's adaptive_strategy_config.json
-# is what actually controls min_liquidity/max_market_cap/rug_risk_threshold via
-# our safety_filters module. The values below are the bot's OWN minimal filters
-# that still apply (token age, match string, mode flags).
 filters:
   match_string: null
   bro_address: null
-  listener_type: "logs"   # only needs RPC + WSS, no Geyser signup required
-  max_token_age: 60       # raised from 30: queue throughput was the bottleneck
+  # PIVOT: from Dexscreener (lagging) to on-chain new-pool detection (leading).
+  # Catches pump.fun graduates the moment their PumpSwap pool is created,
+  # ~hours before Dexscreener trending picks them up. That's where the
+  # +800-3700% movers originate.
+  listener_type: "pumpswap_new_pool"
+  max_token_age: 3600
   marry_mode: false
-  yolo_mode: true         # keep processing tokens instead of exiting after one
+  yolo_mode: true
+
+newpool:
+  warmup_seconds: 60         # ignore WSS events for first minute (dedup baseline)
+  min_post_creation_seconds: 30  # wait 30s after detection before buying (let initial dust settle)
+  max_post_creation_seconds: 300  # if we got behind, skip
+  min_quote_reserve_sol: 30.0  # require ≥30 SOL liquidity (full graduate; rejects rugged pools)
+
+dexscreener:
+  poll_interval_seconds: 45
+  # CALIBRATED FROM 7 LOSING TRADES:
+  # - All 7 losers had pc_1h >= +24% at entry (some >+200%) → we were too late.
+  # - 5 pools rugged after entry (liq drained). Higher min_liq helps avoid this.
+  # - >8h-old tokens were always past their move on Dexscreener.
+  min_age_seconds: 1800          # 30min
+  max_age_seconds: 28800         # 8h (was 24h — too late)
+  min_liquidity_usd: 25000.0     # was 20K
+  min_volume_1h_usd: 10000.0     # was 5K
+  min_price_change_1h_pct: 0.0
+  min_price_change_6h_pct: 0.0
+  max_price_change_24h_pct: 500.0  # was 2000
 
 retries:
   max_attempts: 1
-  wait_after_creation: 12  # let liquidity accumulate so the $3k filter has tokens to pass
-  wait_after_buy: 10
-  wait_before_new_token: 5  # lowered from 15: don't sit idle in yolo_mode
+  wait_after_creation: 0
+  wait_after_buy: 5
+  wait_before_new_token: 5
 
 cleanup:
   mode: "on_fail"
